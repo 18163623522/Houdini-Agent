@@ -1,0 +1,2877 @@
+# -*- coding: utf-8 -*-
+"""
+AI 调用客户端（Houdini 工具专用）
+支持 OpenAI / DeepSeek / 智谱GLM（GLM-4, GLM-Z1推理, GLM-4V视觉）
+支持 Function Calling、流式传输、联网搜索
+
+安全提示：不要将密钥提交到版本库。
+"""
+
+import os
+import sys
+import json
+import ssl
+import time
+import re
+from typing import List, Dict, Optional, Any, Callable, Generator, Tuple
+from urllib.parse import quote_plus
+
+from shared.common_utils import load_config, save_config
+
+# 强制使用本地 lib 目录中的依赖库
+_lib_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'lib')
+if os.path.exists(_lib_path):
+    # 将 lib 目录添加到 sys.path 最前面，确保优先使用
+    if _lib_path in sys.path:
+        sys.path.remove(_lib_path)
+    sys.path.insert(0, _lib_path)
+
+# 导入 requests
+HAS_REQUESTS = False
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    pass
+
+
+# ============================================================
+# 联网搜索功能
+# ============================================================
+
+class WebSearcher:
+    """联网搜索工具 - 多引擎自动降级（Brave → DuckDuckGo）"""
+    
+    # Brave Search（免费 HTML 抓取，Svelte SSR，结果质量好）
+    BRAVE_URL = "https://search.brave.com/search"
+    
+    # DuckDuckGo HTML 搜索（无需 API Key，备用）
+    DUCKDUCKGO_URL = "https://html.duckduckgo.com/html/"
+
+    # 通用请求头
+    _HEADERS = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': 'gzip, deflate',
+    }
+    
+    def __init__(self):
+        pass
+
+    # ------------------------------------------------------------------
+    # 编码修复：requests 默认 ISO-8859-1 会导致中文乱码
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fix_encoding(response) -> str:
+        """智能检测并修正 HTTP 响应的编码，避免中文乱码。
+
+        优先级：
+        1. Content-Type header 中明确声明的 charset（排除 ISO-8859-1 默认值）
+        2. HTML <meta charset="..."> 标签
+        3. requests.apparent_encoding（基于 chardet / charset_normalizer）
+        4. 回退到 UTF-8
+        """
+        # 1) Content-Type 声明的 charset
+        ct_enc = response.encoding
+        if ct_enc and ct_enc.lower() not in ('iso-8859-1', 'latin-1', 'ascii'):
+            return response.text
+
+        # 2) HTML meta 标签
+        raw = response.content[:8192]
+        meta_match = re.search(
+            rb'<meta[^>]*charset=["\']?\s*([a-zA-Z0-9_-]+)',
+            raw, re.IGNORECASE,
+        )
+        if meta_match:
+            declared = meta_match.group(1).decode('ascii', errors='ignore').strip()
+            try:
+                response.encoding = declared
+                return response.text
+            except (LookupError, UnicodeDecodeError):
+                pass
+
+        # 3) apparent_encoding (chardet)
+        apparent = getattr(response, 'apparent_encoding', None)
+        if apparent:
+            try:
+                response.encoding = apparent
+                return response.text
+            except (LookupError, UnicodeDecodeError):
+                pass
+
+        # 4) 回退 UTF-8
+        response.encoding = 'utf-8'
+        return response.text
+
+    @staticmethod
+    def _decode_entities(text: str) -> str:
+        """解码 HTML 实体: &amp; &lt; &gt; &quot; &#xxxx; 等"""
+        import html as _html
+        try:
+            return _html.unescape(text)
+        except Exception:
+            return text
+    
+    # ------------------------------------------------------------------
+    # 搜索
+    # ------------------------------------------------------------------
+
+    def search(self, query: str, max_results: int = 5, timeout: int = 10) -> Dict[str, Any]:
+        """执行网络搜索（多引擎自动降级）
+        
+        优先级：Brave 抓取 → DuckDuckGo 抓取
+        任一引擎成功且有结果即返回，否则尝试下一个。
+        """
+        errors = []
+        
+        # 1. Brave Search（免费 HTML 抓取，结果质量好）
+        result = self._search_brave(query, max_results, timeout)
+        if result.get('success') and result.get('results'):
+            return result
+        errors.append(f"Brave: {result.get('error', 'no results')}")
+        
+        # 2. DuckDuckGo 降级
+        result = self._search_duckduckgo(query, max_results, timeout)
+        if result.get('success') and result.get('results'):
+            return result
+        errors.append(f"DDG: {result.get('error', 'no results')}")
+        
+        return {"success": False, "error": f"All engines failed: {'; '.join(errors)}", "results": []}
+
+    # ---------- Brave Search ----------
+
+    def _search_brave(self, query: str, max_results: int, timeout: int) -> Dict[str, Any]:
+        """通过 Brave Search（HTML 抓取，无需 API Key，结果质量好）"""
+        if not HAS_REQUESTS:
+            return {"success": False, "error": "requests not installed", "results": []}
+        try:
+            params = {'q': query, 'source': 'web'}
+            response = requests.get(
+                self.BRAVE_URL, params=params, headers=self._HEADERS, timeout=timeout,
+            )
+            response.raise_for_status()
+            page_html = self._fix_encoding(response)
+            results = self._parse_brave_html(page_html, max_results)
+            if results:
+                return {"success": True, "query": query, "results": results, "source": "Brave"}
+            return {"success": False, "error": "Brave returned page but no results parsed", "results": []}
+        except Exception as e:
+            return {"success": False, "error": str(e), "results": []}
+
+    def _parse_brave_html(self, page_html: str, max_results: int) -> List[Dict[str, str]]:
+        """解析 Brave Search 结果页（Svelte SSR 结构）
+        
+        Brave 结构:
+          <div class="snippet svelte-..." data-type="web" data-pos="N">
+            <a href="URL">
+              <div class="title search-snippet-title ...">TITLE</div>
+            </a>
+            <div class="snippet-description ...">DESCRIPTION</div>
+            或直接嵌入文本段落
+          </div>
+        """
+        results: List[Dict[str, str]] = []
+        
+        block_starts = list(re.finditer(
+            r'<div[^>]*class="snippet\b[^"]*"[^>]*data-type="web"[^>]*>',
+            page_html, re.IGNORECASE,
+        ))
+        
+        for i, match in enumerate(block_starts[:max_results + 5]):
+            start = match.start()
+            end = block_starts[i + 1].start() if i + 1 < len(block_starts) else start + 4000
+            block = page_html[start:end]
+            
+            # URL: 第一个外部 <a href="https://...">
+            url_m = re.search(r'<a[^>]*href="(https?://[^"]+)"', block, re.IGNORECASE)
+            url = url_m.group(1) if url_m else ''
+            if not url or 'brave.com' in url:
+                continue
+            
+            # Title: class="title search-snippet-title ..."
+            title = ''
+            for title_pat in (
+                r'class="title\b[^"]*search-snippet-title[^"]*"[^>]*>(.*?)</div>',
+                r'class="[^"]*search-snippet-title[^"]*"[^>]*>(.*?)</(?:span|div)>',
+                r'class="snippet-title[^"]*"[^>]*>(.*?)</(?:span|div)>',
+            ):
+                title_m = re.search(title_pat, block, re.DOTALL | re.IGNORECASE)
+                if title_m:
+                    title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
+                    # 去掉日期后缀（如 "Title 2025年11月6日 -"）
+                    title = re.sub(r'\s*\d{4}年\d{1,2}月\d{1,2}日\s*-?\s*$', '', title)
+                    break
+            
+            if not title:
+                # 退而求其次：块内有意义文本（跳过网站名/URL片段）
+                segments = re.findall(r'>([^<]{8,})<', block)
+                for seg in segments:
+                    seg = seg.strip()
+                    if (seg and 'svg' not in seg.lower()
+                            and 'path' not in seg.lower()
+                            and not seg.startswith('›')
+                            and '.' not in seg[:10]):  # 跳过 URL 片段
+                        title = self._decode_entities(seg[:120])
+                        break
+            
+            # Description: 各种可能的容器
+            desc = ''
+            for desc_pat in (
+                r'class="[^"]*snippet-description[^"]*"[^>]*>(.*?)</(?:div|p|span)>',
+                r'class="[^"]*snippet-content[^"]*"[^>]*>(.*?)</(?:div|p|span)>',
+            ):
+                desc_m = re.search(desc_pat, block, re.DOTALL | re.IGNORECASE)
+                if desc_m:
+                    desc = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip()
+                    desc = self._decode_entities(desc)
+                    break
+            
+            # 如果没有 snippet-description，从文本段落中提取
+            if not desc:
+                segments = re.findall(r'>([^<]{20,})<', block)
+                for seg in segments:
+                    seg = seg.strip()
+                    # 跳过标题本身、URL 面包屑、SVG 数据
+                    if (seg and seg != title
+                            and 'svg' not in seg.lower()
+                            and not seg.startswith('›')
+                            and not re.match(r'^[\d年月日\s\-]+$', seg)):
+                        desc = self._decode_entities(seg[:300])
+                        break
+            
+            results.append({
+                'title': self._decode_entities(title) if title else '(no title)',
+                'url': url,
+                'snippet': desc[:300],
+            })
+            if len(results) >= max_results:
+                break
+        
+        return results
+
+    # ---------- DuckDuckGo ----------
+
+    def _search_duckduckgo(self, query: str, max_results: int, timeout: int) -> Dict[str, Any]:
+        """使用 DuckDuckGo 搜索（HTML lite 版本，备用）"""
+        if not HAS_REQUESTS:
+            return {"success": False, "error": "requests not installed", "results": []}
+        
+        try:
+            response = requests.post(
+                self.DUCKDUCKGO_URL,
+                data={'q': query, 'b': '', 'kl': 'cn-zh'},
+                headers=self._HEADERS,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            page_html = self._fix_encoding(response)
+            results = self._parse_duckduckgo_html(page_html, max_results)
+            
+            if results:
+                return {"success": True, "query": query, "results": results, "source": "DuckDuckGo"}
+            return {"success": False, "error": "DDG returned page but no results parsed", "results": []}
+        except Exception as e:
+            return {"success": False, "error": str(e), "results": []}
+    
+    def _parse_duckduckgo_html(self, page_html: str, max_results: int) -> List[Dict[str, str]]:
+        """解析 DuckDuckGo HTML 搜索结果（兼容多种页面结构）"""
+        from urllib.parse import unquote, parse_qs, urlparse
+        results = []
+        
+        # 模式 1: class="result__a"（经典版）
+        pattern = r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>'
+        matches = re.findall(pattern, page_html, re.IGNORECASE | re.DOTALL)
+        
+        # 模式 2: lite 版 <a rel="nofollow">
+        if not matches:
+            pattern = r'<a[^>]*rel="nofollow"[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>'
+            matches = re.findall(pattern, page_html, re.IGNORECASE | re.DOTALL)
+        
+        for url, raw_title in matches[:max_results]:
+            if not url or 'duckduckgo.com' in url:
+                continue
+            title = re.sub(r'<[^>]+>', '', raw_title).strip()
+            title = self._decode_entities(title)
+            if not title:
+                continue
+            
+            real_url = url
+            if 'uddg=' in url:
+                try:
+                    parsed = urlparse(url)
+                    params = parse_qs(parsed.query)
+                    if 'uddg' in params:
+                        real_url = unquote(params['uddg'][0])
+                except Exception:
+                    pass
+            
+            results.append({"title": title, "url": real_url, "snippet": ""})
+        
+        # 提取摘要
+        for pat in (r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
+                    r'<td[^>]*class="result-snippet"[^>]*>(.*?)</td>'):
+            snippet_matches = re.findall(pat, page_html, re.IGNORECASE | re.DOTALL)
+            if snippet_matches:
+                for i, raw in enumerate(snippet_matches[:len(results)]):
+                    clean = re.sub(r'<[^>]+>', '', raw).strip()
+                    clean = self._decode_entities(clean)
+                    if clean:
+                        results[i]["snippet"] = clean[:300]
+                break
+        
+        return results
+    
+    # (Bing API 已移除 — 需要付费 Azure Key，不实用)
+
+    # ------------------------------------------------------------------
+    # 网页抓取
+    # ------------------------------------------------------------------
+    
+    def fetch_page_content(self, url: str, max_lines: int = 80,
+                           start_line: int = 1, timeout: int = 15) -> Dict[str, Any]:
+        """获取网页内容（自动修正编码 + 按行分页，支持翻页）
+        
+        Args:
+            url: 网页 URL
+            max_lines: 每页最大行数
+            start_line: 从第几行开始（1-based），用于翻页
+            timeout: 请求超时秒数
+        """
+        if not HAS_REQUESTS:
+            return {"success": False, "error": "需要安装 requests 库"}
+        
+        try:
+            response = requests.get(url, headers=self._HEADERS, timeout=timeout)
+            response.raise_for_status()
+            
+            # 修正编码（防乱码核心）
+            page_html = self._fix_encoding(response)
+            
+            # 移除无用区块
+            for tag in ('script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript'):
+                page_html = re.sub(
+                    rf'<{tag}[^>]*>.*?</{tag}>',
+                    '', page_html, flags=re.DOTALL | re.IGNORECASE,
+                )
+            
+            # 块级标签 → 换行
+            page_html = re.sub(r'<br\s*/?\s*>', '\n', page_html, flags=re.IGNORECASE)
+            page_html = re.sub(
+                r'</(?:p|div|li|tr|td|th|h[1-6]|blockquote|section|article)>',
+                '\n', page_html, flags=re.IGNORECASE,
+            )
+            
+            # 移除剩余 HTML 标签
+            text = re.sub(r'<[^>]+>', ' ', page_html)
+            
+            # 解码 HTML 实体
+            text = self._decode_entities(text)
+            
+            # 清理：每行合并多余空格，保留换行结构
+            lines = []
+            for line in text.split('\n'):
+                cleaned = re.sub(r'[ \t]+', ' ', line).strip()
+                if cleaned:
+                    lines.append(cleaned)
+            
+            total_lines = len(lines)
+            
+            # 按 start_line 偏移（1-based → 0-based）
+            offset = max(0, start_line - 1)
+            page_lines = lines[offset:offset + max_lines]
+            end_line = offset + len(page_lines)
+            
+            if not page_lines:
+                return {
+                    "success": True,
+                    "url": url,
+                    "content": f"[已到末尾] 该网页共 {total_lines} 行，start_line={start_line} 超出范围。"
+                }
+            
+            content = '\n'.join(page_lines)
+            
+            # 如果后面还有更多行，附带翻页提示
+            if end_line < total_lines:
+                next_start = end_line + 1
+                content += (
+                    f"\n\n[分页提示] 当前显示第 {offset+1}-{end_line} 行，共 {total_lines} 行。"
+                    f"如需后续内容，请调用 fetch_webpage(url=\"{url}\", start_line={next_start})。"
+                )
+            else:
+                content += f"\n\n[全部内容已显示] 第 {offset+1}-{end_line} 行，共 {total_lines} 行。"
+            
+            return {
+                "success": True,
+                "url": url,
+                "content": content
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "url": url}
+
+
+# ============================================================
+# Houdini 工具定义
+# ============================================================
+
+HOUDINI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_wrangle_node",
+            "description": "【优先使用】创建 Wrangle 节点并设置 VEX 代码。这是解决几何处理问题的首选方式，能用 VEX 解决的问题都应该用这个工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vex_code": {
+                        "type": "string",
+                        "description": "VEX 代码内容。常用语法：@P（位置）, @N（法线）, @Cd（颜色）, @pscale（点大小）, addpoint(), addprim(), addvertex() 等"
+                    },
+                    "wrangle_type": {
+                        "type": "string",
+                        "enum": ["attribwrangle", "pointwrangle", "primitivewrangle", "volumewrangle", "vertexwrangle"],
+                        "description": "Wrangle 类型。默认 'attribwrangle'（最通用）。pointwrangle 处理点，primitivewrangle 处理图元"
+                    },
+                    "node_name": {
+                        "type": "string",
+                        "description": "节点名称（可选）"
+                    },
+                    "run_over": {
+                        "type": "string",
+                        "enum": ["Points", "Vertices", "Primitives", "Detail"],
+                        "description": "运行模式：Points（点，默认）, Vertices（顶点）, Primitives（图元）, Detail（全局）"
+                    },
+                    "parent_path": {
+                        "type": "string",
+                        "description": "父网络路径（可选，留空使用当前网络）"
+                    }
+                },
+                "required": ["vex_code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_network_structure",
+            "description": "获取当前网络编辑器中的节点网络结构，包括所有节点名称、类型和连接关系。轻量级操作，不包含详细参数。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "network_path": {
+                        "type": "string",
+                        "description": "网络路径如 '/obj/geo1'，留空使用当前网络"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_node_details",
+            "description": "获取指定节点的详细信息，包括所有参数及当前值。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {
+                        "type": "string",
+                        "description": "节点完整路径如 '/obj/geo1/box1'"
+                    }
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_node_parameters",
+            "description": "获取节点的所有可用参数列表（名称、类型、默认值、当前值）。在设置参数之前必须先调用此工具确认参数名。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {
+                        "type": "string",
+                        "description": "节点完整路径如 '/obj/geo1/box1'"
+                    }
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_node_parameter",
+            "description": "设置节点参数值。注意：调用前必须先用 get_node_parameters 确认参数名和类型，不要猜测参数名。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点路径"},
+                    "param_name": {"type": "string", "description": "参数名（必须是 get_node_parameters 返回的有效参数名）"},
+                    "value": {"type": ["string", "number", "boolean", "array"], "description": "参数值"}
+                },
+                "required": ["node_path", "param_name", "value"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_node",
+            "description": "创建单个节点。节点类型格式：'box' 或 'sop/box'（推荐直接写节点名如'box'，系统会自动识别类别）。如果创建失败，必须调用 search_node_types 查找正确的节点类型名再重试，不要盲目重试。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_type": {
+                        "type": "string", 
+                        "description": "节点类型名称，如 'box', 'scatter', 'noise'。直接写节点名即可，系统会自动识别类别（sop/obj等）。"
+                    },
+                    "node_name": {"type": "string", "description": "节点名称（可选），如不提供会自动生成"},
+                    "parameters": {"type": "object", "description": "初始参数字典（可选），如 {'size': 1.0}"},
+                    "parent_path": {"type": "string", "description": "父网络路径（可选），如 '/obj/geo1'，留空使用当前网络"}
+                },
+                "required": ["node_type"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_nodes_batch",
+            "description": "批量创建节点并自动连接。nodes 数组中每个元素需要 id（临时标识）和 type（节点类型）；connections 数组指定连接关系，from/to 使用 nodes 中的 id。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "type": {"type": "string"},
+                                "name": {"type": "string"},
+                                "parms": {"type": "object"}
+                            },
+                            "required": ["id", "type"]
+                        }
+                    },
+                    "connections": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {"type": "string"},
+                                "to": {"type": "string"},
+                                "input": {"type": "integer"}
+                            }
+                        }
+                    }
+                },
+                "required": ["nodes"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "connect_nodes",
+            "description": "连接两个节点。连接前应先用 get_node_inputs 查询目标节点的输入端口含义。input_index: 0=第一输入, 1=第二输入(如copytopoints的目标点), 2=第三输入。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_path": {"type": "string", "description": "上游节点路径（提供数据的节点）"},
+                    "to_path": {"type": "string", "description": "下游节点路径（接收数据的节点）"},
+                    "input_index": {"type": "integer", "description": "目标节点的输入端口索引。0=主输入，1=第二输入（如copy的目标点），2=第三输入。默认0"}
+                },
+                "required": ["from_path", "to_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_node",
+            "description": "删除指定路径的节点。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "要删除的节点完整路径，如 '/obj/geo1/box1'"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_node_types",
+            "description": "按关键词搜索 Houdini 可用的节点类型。用于精确查找节点。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "搜索关键词，如 'scatter', 'copy'"},
+                    "category": {"type": "string", "enum": ["sop", "obj", "dop", "vop", "cop", "all"], "description": "节点类别，默认 'all'"},
+                    "limit": {"type": "integer", "description": "最大结果数，默认 10"}
+                },
+                "required": ["keyword"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_search_nodes",
+            "description": "通过自然语言描述搜索合适的节点类型。例如：'我需要在表面上随机分布点'会找到 scatter 节点。当你不确定用什么节点时使用此工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "用自然语言描述你想要的功能，如 '在表面分布点'、'复制物体到点上'、'创建噪波变形'"
+                    },
+                    "category": {"type": "string", "enum": ["sop", "obj", "dop", "vop", "all"], "description": "节点类别，默认 'sop'"}
+                },
+                "required": ["description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_children",
+            "description": "列出网络下的所有子节点，类似文件系统的 ls 命令。显示节点名称、类型和状态。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "network_path": {"type": "string", "description": "网络路径，如 '/obj/geo1'。留空使用当前网络"},
+                    "recursive": {"type": "boolean", "description": "是否递归列出子网络，默认 false"},
+                    "show_flags": {"type": "boolean", "description": "是否显示节点标志（显示/渲染/旁路），默认 true"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_geometry_info",
+            "description": "获取节点输出的几何体信息，包括点数、面数、属性列表等。用于了解数据结构。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点路径"},
+                    "output_index": {"type": "integer", "description": "输出端口索引，默认 0"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_selection",
+            "description": "读取当前选中节点的详细信息。不需要知道节点路径，直接读取用户选中的内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_params": {"type": "boolean", "description": "是否包含参数详情，默认 true"},
+                    "include_geometry": {"type": "boolean", "description": "是否包含几何体信息，默认 false"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_display_flag",
+            "description": "设置节点的显示标志。控制哪个节点在视口中显示。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点路径"},
+                    "display": {"type": "boolean", "description": "是否设为显示节点"},
+                    "render": {"type": "boolean", "description": "是否设为渲染节点"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "copy_node",
+            "description": "复制/克隆节点到新位置。可以复制到同一网络或其他网络。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string", "description": "源节点路径"},
+                    "dest_network": {"type": "string", "description": "目标网络路径，留空则复制到同一网络"},
+                    "new_name": {"type": "string", "description": "新节点名称（可选）"}
+                },
+                "required": ["source_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "batch_set_parameters",
+            "description": "批量修改多个节点的参数。类似 search_replace，可以在多个节点中同时修改某个参数。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "节点路径列表"
+                    },
+                    "param_name": {"type": "string", "description": "参数名"},
+                    "value": {"type": ["string", "number", "boolean", "array"], "description": "新值"}
+                },
+                "required": ["node_paths", "param_name", "value"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_nodes_by_param",
+            "description": "在网络中搜索具有特定参数值的节点。类似 grep 搜索。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "network_path": {"type": "string", "description": "搜索的网络路径，留空使用当前网络"},
+                    "param_name": {"type": "string", "description": "参数名"},
+                    "value": {"type": ["string", "number"], "description": "要匹配的值（可选，留空则列出所有有此参数的节点）"},
+                    "recursive": {"type": "boolean", "description": "是否递归搜索子网络，默认 true"}
+                },
+                "required": ["param_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_hip",
+            "description": "保存当前 HIP 文件。可以保存到当前路径或指定新路径。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "保存路径（可选，留空则保存到当前文件）"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "undo_redo",
+            "description": "执行撤销或重做操作。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["undo", "redo"], "description": "操作类型"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "联网搜索任意信息。可搜索天气、新闻、技术文档、Houdini 帮助、编程问题、百科知识等任何内容。只要用户的问题涉及你不确定或需要最新数据的信息，都应主动调用此工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "最大结果数，默认 5"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_webpage",
+            "description": "获取指定 URL 的网页正文内容（按行分页）。首次调用返回第 1 行起的内容；如结果末尾有 [分页提示]，可传入 start_line 获取后续行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "网页 URL"
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "从第几行开始返回（默认 1）。用于翻页：如上次显示到第 80 行，传 81 获取后续内容"
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_local_doc",
+            "description": "搜索本地 Houdini 文档索引（节点/VEX函数/HOM类）。常见信息已自动注入上下文，仅在需要更多细节时主动调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string", 
+                        "description": "关键词，如节点名'attribwrangle'、VEX函数名'addpoint'、HOM类'hou.Node'"
+                    },
+                    "top_k": {
+                        "type": "integer", 
+                        "description": "返回前k个结果（默认5）"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_houdini_node_doc",
+            "description": "获取节点的帮助文档（自动降级：本地帮助服务器 -> SideFX在线文档 -> 节点类型信息）。用于查看节点的详细说明、参数含义和用法。优先使用 get_node_inputs 获取输入端口信息，本工具用于需要更详细文档时。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_type": {
+                        "type": "string",
+                        "description": "节点类型名称"
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["sop", "obj", "dop", "vop", "cop", "rop"],
+                        "description": "节点类别，默认 'sop'"
+                    }
+                },
+                "required": ["node_type"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_python",
+            "description": "在 Houdini Python Shell 中执行代码。可以执行任意 Python 代码，访问 hou 模块操作场景。执行结果（包括 print 输出和错误信息）会完整返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "要执行的 Python 代码"
+                    }
+                },
+                "required": ["code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_errors",
+            "description": "检查节点或网络中的错误和警告。这是修复问题的重要工具，在创建节点后应该调用来验证是否有错误。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {
+                        "type": "string",
+                        "description": "要检查的节点或网络路径。如果是网络路径，会检查其下所有节点。留空则检查当前网络。"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_node_inputs",
+            "description": "【连接前必用】获取节点输入端口信息(210个常用节点已缓存,快速返回)。连接多输入节点前必用!常见节点已包含完整信息,优先使用此工具而非get_houdini_node_doc。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_type": {
+                        "type": "string",
+                        "description": "节点类型名称，如 'copytopoints', 'boolean', 'scatter'"
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["sop", "obj", "dop", "vop"],
+                        "description": "节点类别，默认 'sop'"
+                    }
+                },
+                "required": ["node_type"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_todo",
+            "description": "添加一个任务到 Todo 列表。在开始复杂任务前，先用这个工具列出计划的步骤。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {
+                        "type": "string",
+                        "description": "任务唯一 ID，如 'step1', 'task_create_box'"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "任务描述"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "done", "error"],
+                        "description": "任务状态，默认 pending"
+                    }
+                },
+                "required": ["todo_id", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_todo",
+            "description": "更新 Todo 任务状态。每完成一个步骤必须立即调用此工具标记为 done，不要等到最后统一标记。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {
+                        "type": "string",
+                        "description": "要更新的任务 ID"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "done", "error"],
+                        "description": "新状态"
+                    }
+                },
+                "required": ["todo_id", "status"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_and_summarize",
+            "description": "【任务结束前必调用】验证节点网络并生成总结。自动检测:1.孤立节点 2.错误节点 3.连接完整性 4.显示标志。如果发现问题必须修复后重新调用，直到通过。在此之前应先用 get_network_structure 自行检查网络是否完整。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "check_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要检查的项目列表(如节点名)"
+                    },
+                    "expected_result": {
+                        "type": "string",
+                        "description": "期望的结果描述"
+                    }
+                },
+                "required": ["check_items", "expected_result"]
+            }
+        }
+    }
+]
+
+
+# ============================================================
+# AI 客户端
+# ============================================================
+
+class AIClient:
+    """AI 客户端，支持流式传输、Function Calling、联网搜索"""
+    
+    OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+    DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+    GLM_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    OLLAMA_API_URL = "http://localhost:11434/v1/chat/completions"  # Ollama OpenAI 兼容接口
+    DUOJIE_API_URL = "https://api.duojie.games/v1/chat/completions"  # 拼好饭中转站
+
+    def __init__(self, api_key: Optional[str] = None):
+        self._api_keys: Dict[str, Optional[str]] = {
+            'openai': api_key or self._read_api_key('openai'),
+            'deepseek': self._read_api_key('deepseek'),
+            'glm': self._read_api_key('glm'),
+            'ollama': 'ollama',  # Ollama 不需要真正的 API key，但需要非空值
+            'duojie': self._read_api_key('duojie'),
+        }
+        self._ssl_context = self._create_ssl_context()
+        self._web_searcher = WebSearcher()
+        self._tool_executor: Optional[Callable[[str, dict], dict]] = None
+        
+        # Ollama 配置
+        self._ollama_base_url = "http://localhost:11434"
+        
+        # 网络配置
+        self._max_retries = 3
+        self._retry_delay = 1.0
+        self._chunk_timeout = 60  # Ollama 本地模型可能较慢，增加超时
+        
+        # 停止控制（使用 threading.Event 保证线程安全）
+        import threading
+        self._stop_event = threading.Event()
+    
+    def request_stop(self):
+        """请求停止当前请求（线程安全）"""
+        self._stop_event.set()
+    
+    def reset_stop(self):
+        """重置停止标志（线程安全）"""
+        self._stop_event.clear()
+    
+    def is_stop_requested(self) -> bool:
+        """检查是否请求了停止（线程安全）"""
+        return self._stop_event.is_set()
+
+    def set_tool_executor(self, executor: Callable[..., dict]):
+        """设置工具执行器
+        
+        executor 签名: (tool_name: str, **kwargs) -> dict
+        """
+        self._tool_executor = executor
+
+    # ----------------------------------------------------------
+    # 工具结果分页：按行分段，让 AI 自主判断是否需要更多
+    # ----------------------------------------------------------
+
+    # 查询型工具 & 操作型工具分类（共用常量）
+    _QUERY_TOOLS = frozenset({
+        'get_network_structure', 'get_node_details', 'get_node_parameters',
+        'list_children',
+        'get_geometry_info', 'read_selection', 'search_node_types',
+        'semantic_search_nodes', 'find_nodes_by_param', 'check_errors',
+        'search_local_doc', 'get_houdini_node_doc', 'get_node_inputs',
+        'execute_python', 'web_search', 'fetch_webpage',
+    })
+    _OP_TOOLS = frozenset({
+        'create_node', 'create_nodes_batch', 'connect_nodes',
+        'set_node_parameter', 'create_wrangle_node',
+    })
+
+    @staticmethod
+    def _paginate_result(text: str, max_lines: int = 50) -> str:
+        """将工具结果按行分页，超出部分截断并附带分页提示。
+
+        - 不超过 max_lines 行时原样返回
+        - 超过时保留前 max_lines 行，并追加分页说明
+
+        Args:
+            text: 原始工具输出文本
+            max_lines: 每页最大行数（默认 50）
+
+        Returns:
+            分页后的文本
+        """
+        if not text:
+            return text
+        lines = text.split('\n')
+        total = len(lines)
+        if total <= max_lines:
+            return text
+        page = '\n'.join(lines[:max_lines])
+        return (
+            f"{page}\n\n"
+            f"[分页提示] 显示第 1-{max_lines} 行，共 {total} 行（已截断）。"
+            f"当前信息如已足够请直接使用。"
+            f"注意：用相同参数重复调用会得到相同结果。"
+            f"如需更多信息请换用更精确的查询条件，或使用 fetch_webpage 获取特定 URL 的完整内容（支持 start_line 翻页）。"
+        )
+
+    # ------------------------------------------------------------------
+    # 消息清洗：确保发送给 API 的消息格式正确
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ensure_tool_call_ids(tool_calls: list) -> list:
+        """确保每个 tool_call 都有有效的 id 字段
+        
+        代理 API（如 Duojie）有时不在第一个 chunk 提供 tool_call_id，
+        导致后续 role:tool 消息的 tool_call_id 为空 → API 400 错误。
+        """
+        import uuid
+        for tc in tool_calls:
+            if not tc.get('id'):
+                tc['id'] = f"call_{uuid.uuid4().hex[:24]}"
+            # 确保 type 字段存在
+            if not tc.get('type'):
+                tc['type'] = 'function'
+            # 确保 function 字段完整
+            fn = tc.get('function', {})
+            if not fn.get('name'):
+                fn['name'] = 'unknown'
+            if 'arguments' not in fn:
+                fn['arguments'] = '{}'
+            tc['function'] = fn
+        return tool_calls
+
+    def _progressive_trim(self, working_messages: list, tool_calls_history: list,
+                          trim_level: int = 1) -> list:
+        """渐进式裁剪上下文，根据 trim_level 逐步加大裁剪力度
+        
+        trim_level=1: 轻度 - 压缩 tool 结果 + 移除中间部分旧消息（保留最近 60%）
+        trim_level=2: 中度 - 保留 system + 最近 10 条消息
+        trim_level=3+: 重度 - 保留 system + 最近 6 条消息
+        
+        Returns:
+            裁剪后的消息列表
+        """
+        if not working_messages:
+            return working_messages
+        
+        sys_msg = working_messages[0] if working_messages and working_messages[0].get('role') == 'system' else None
+        body = working_messages[1:] if sys_msg else working_messages[:]
+        
+        if trim_level <= 1:
+            # 轻度裁剪：先压缩所有 tool/assistant 消息的内容，再移除前 40% 的消息
+            for m in body:
+                if m.get('role') == 'tool':
+                    c = m.get('content', '')
+                    if len(c) > 150:
+                        m['content'] = c[:150] + '...[已截断]'
+                elif m.get('role') == 'assistant':
+                    c = m.get('content', '')
+                    if len(c) > 300:
+                        m['content'] = c[:300] + '...[已截断]'
+            
+            # 保留后 60% 的消息（至少保留最后 8 条）
+            keep_n = max(8, int(len(body) * 0.6))
+            if len(body) > keep_n:
+                body = body[-keep_n:]
+        
+        elif trim_level == 2:
+            # 中度裁剪：只保留最近 10 条，并压缩内容
+            keep_n = 10
+            body = body[-keep_n:] if len(body) > keep_n else body
+            for m in body:
+                if m.get('role') == 'tool':
+                    c = m.get('content', '')
+                    if len(c) > 100:
+                        m['content'] = c[:100] + '...[已截断]'
+                elif m.get('role') == 'assistant':
+                    c = m.get('content', '')
+                    if len(c) > 200:
+                        m['content'] = c[:200] + '...[已截断]'
+        
+        else:
+            # 重度裁剪：只保留最近 6 条，并激进压缩
+            keep_n = 6
+            body = body[-keep_n:] if len(body) > keep_n else body
+            for m in body:
+                c = m.get('content', '')
+                if len(c) > 100:
+                    m['content'] = c[:100] + '...[已截断]'
+        
+        # 重组消息
+        result = ([sys_msg] if sys_msg else []) + body
+        
+        # 添加恢复提示（使用 system 角色而非 user）
+        history_summary = ""
+        if tool_calls_history:
+            recent = tool_calls_history[-8:]
+            summaries = [f"  - {h['tool_name']}: {str(h.get('result', ''))[:80]}" for h in recent]
+            history_summary = "\n已完成的操作:\n" + "\n".join(summaries)
+        
+        # 在 body 的最后一条 assistant 或 user 消息之后插入 system 恢复提示
+        result.append({
+            'role': 'system',
+            'content': (
+                f'[上下文管理] 由于消息过长，已自动裁剪历史（裁剪级别 {trim_level}）。'
+                f'{history_summary}'
+                f'\n请继续完成当前任务。不要提及或解释此裁剪操作。'
+            )
+        })
+        
+        print(f"[AI Client] 渐进式裁剪: level={trim_level}, "
+              f"消息 {len(working_messages)} → {len(result)}")
+        return result
+    
+    def _sanitize_working_messages(self, messages: list) -> list:
+        """在发送给 API 之前清洗消息列表，修复常见格式问题
+        
+        修复项：
+        1. assistant 消息中 tool_calls 的 id 为空
+        2. role:tool 消息的 tool_call_id 与 assistant 中的 id 不匹配
+        3. 移除无效的 tool 消息（没有对应 assistant tool_call）
+        """
+        # 收集所有有效的 tool_call_id
+        valid_tc_ids = set()
+        for msg in messages:
+            if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                self._ensure_tool_call_ids(msg['tool_calls'])
+                for tc in msg['tool_calls']:
+                    if tc.get('id'):
+                        valid_tc_ids.add(tc['id'])
+        
+        # 修复 tool 消息的 tool_call_id
+        sanitized = []
+        for msg in messages:
+            if msg.get('role') == 'tool':
+                tc_id = msg.get('tool_call_id', '')
+                if not tc_id or tc_id not in valid_tc_ids:
+                    # 跳过孤儿 tool 消息（没有对应的 assistant tool_call）
+                    continue
+            sanitized.append(msg)
+        return sanitized
+
+    def _compress_tool_result(self, tool_name: str, result: dict) -> str:
+        """统一工具结果压缩逻辑（供两种 agent loop 共用）
+
+        策略：
+        - 查询工具 → 按行分页（默认 50 行）
+        - 操作工具 → 提取路径，保留关键信息
+        - 其他工具 → 适度截断
+        - 失败 → 保留完整错误
+        """
+        if result.get('success'):
+            content = result.get('result', '')
+            if tool_name in self._QUERY_TOOLS:
+                return self._paginate_result(content, max_lines=50)
+            elif tool_name in self._OP_TOOLS:
+                if len(content) > 300:
+                    import re
+                    paths = re.findall(r'[/\w]+(?:/[\w]+)+', content)
+                    if paths:
+                        content = ' '.join(paths[:5])
+                        if len(content) > 300:
+                            content = content[:300] + '...'
+                    else:
+                        content = content[:300]
+                return content
+            else:
+                # 其他工具也按行分页，但更宽松
+                return self._paginate_result(content, max_lines=80)
+        else:
+            error = result.get('error', '未知错误')
+            return error[:500] if len(error) > 500 else error
+
+    def _create_ssl_context(self):
+        """创建 SSL 上下文。验证失败时回退到未验证模式（带警告）。"""
+        try:
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            return context
+        except Exception as e:
+            print(f"[AI Client] ⚠️ SSL 证书验证失败 ({e})，回退到未验证模式。这可能存在安全风险。")
+            try:
+                return ssl._create_unverified_context()
+            except Exception:
+                return None
+
+    def _read_api_key(self, provider: str) -> Optional[str]:
+        provider = (provider or 'openai').lower()
+        
+        # Ollama 不需要 API key
+        if provider == 'ollama':
+            return 'ollama'
+        
+        env_map = {
+            'openai': ['OPENAI_API_KEY', 'DCC_AI_OPENAI_API_KEY'],
+            'deepseek': ['DEEPSEEK_API_KEY', 'DCC_AI_DEEPSEEK_API_KEY'],
+            'glm': ['GLM_API_KEY', 'ZHIPU_API_KEY', 'DCC_AI_GLM_API_KEY'],
+            'duojie': ['DUOJIE_API_KEY', 'DCC_AI_DUOJIE_API_KEY'],
+        }
+        for env_var in env_map.get(provider, []):
+            key = os.environ.get(env_var)
+            if key:
+                return key
+        cfg, _ = load_config('ai', dcc_type='houdini')
+        if cfg:
+            key_map = {
+                'openai': 'openai_api_key', 'deepseek': 'deepseek_api_key',
+                'glm': 'glm_api_key', 'duojie': 'duojie_api_key',
+            }
+            return cfg.get(key_map.get(provider, '')) or None
+        return None
+
+    def has_api_key(self, provider: str = 'openai') -> bool:
+        provider = (provider or 'openai').lower()
+        # Ollama 总是可用（本地服务）
+        if provider == 'ollama':
+            return True
+        return bool(self._api_keys.get(provider))
+
+    def _get_api_key(self, provider: str) -> Optional[str]:
+        return self._api_keys.get((provider or 'openai').lower())
+
+    def set_api_key(self, key: str, persist: bool = False, provider: str = 'openai') -> bool:
+        provider = (provider or 'openai').lower()
+        key = (key or '').strip()
+        if not key:
+            return False
+        self._api_keys[provider] = key
+        if persist:
+            cfg, _ = load_config('ai', dcc_type='houdini')
+            cfg = cfg or {}
+            key_map = {'openai': 'openai_api_key', 'deepseek': 'deepseek_api_key', 'glm': 'glm_api_key'}
+            cfg[key_map.get(provider, f'{provider}_api_key')] = key
+            ok, _ = save_config('ai', cfg, dcc_type='houdini')
+            return ok
+        return True
+
+    def get_masked_key(self, provider: str = 'openai') -> str:
+        provider = (provider or 'openai').lower()
+        # Ollama 显示本地状态
+        if provider == 'ollama':
+            return 'Local'
+        key = self._get_api_key(provider)
+        if not key:
+            return ''
+        if len(key) <= 10:
+            return '*' * len(key)
+        return key[:5] + '...' + key[-4:]
+
+    def _get_api_url(self, provider: str) -> str:
+        provider = (provider or 'openai').lower()
+        if provider == 'deepseek':
+            return self.DEEPSEEK_API_URL
+        elif provider == 'glm':
+            return self.GLM_API_URL
+        elif provider == 'ollama':
+            return self.OLLAMA_API_URL
+        elif provider == 'duojie':
+            return self.DUOJIE_API_URL
+        return self.OPENAI_API_URL
+
+    def _get_vendor_name(self, provider: str) -> str:
+        names = {
+            'openai': 'OpenAI', 'deepseek': 'DeepSeek',
+            'glm': 'GLM（智谱AI）', 'ollama': 'Ollama',
+            'duojie': '拼好饭',
+        }
+        return names.get(provider, provider)
+    
+    def set_ollama_url(self, base_url: str):
+        """设置 Ollama 服务地址"""
+        self._ollama_base_url = base_url.rstrip('/')
+        self.OLLAMA_API_URL = f"{self._ollama_base_url}/v1/chat/completions"
+    
+    def get_ollama_models(self) -> List[str]:
+        """获取 Ollama 可用的模型列表"""
+        if not HAS_REQUESTS:
+            return ['qwen2.5:14b']
+        
+        try:
+            response = requests.get(
+                f"{self._ollama_base_url}/api/tags",
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                models = [m.get('name', '') for m in data.get('models', [])]
+                return models if models else ['qwen2.5:14b']
+        except Exception:
+            pass
+        
+        return ['qwen2.5:14b']  # 默认模型
+
+    def test_connection(self, provider: str = 'deepseek') -> Dict[str, Any]:
+        """测试连接"""
+        provider = (provider or 'deepseek').lower()
+        
+        # Ollama 特殊处理
+        if provider == 'ollama':
+            try:
+                if HAS_REQUESTS:
+                    response = requests.get(
+                        f"{self._ollama_base_url}/api/tags",
+                        timeout=5
+                    )
+                    if response.status_code == 200:
+                        return {'ok': True, 'url': self._ollama_base_url, 'status': 200}
+                    return {'ok': False, 'error': f'Ollama 服务响应异常: {response.status_code}'}
+            except Exception as e:
+                return {'ok': False, 'error': f'无法连接 Ollama 服务: {str(e)}'}
+        
+        api_key = self._get_api_key(provider)
+        if not api_key:
+            return {'ok': False, 'error': f'缺少 API Key'}
+        
+        try:
+            if HAS_REQUESTS:
+                response = requests.post(
+                    self._get_api_url(provider),
+                    json={'model': self._get_default_model(provider), 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 1},
+                    headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+                    timeout=15,
+                    proxies={'http': None, 'https': None}
+                )
+                return {'ok': True, 'url': self._get_api_url(provider), 'status': response.status_code}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def _get_default_model(self, provider: str) -> str:
+        defaults = {
+            'openai': 'gpt-4o-mini', 
+            'deepseek': 'deepseek-chat', 
+            'glm': 'glm-4.7',
+            'ollama': 'qwen2.5:14b'
+        }
+        return defaults.get(provider, 'gpt-4o-mini')
+
+    # ============================================================
+    # 模型特性判断
+    # ============================================================
+    
+    @staticmethod
+    def is_reasoning_model(model: str) -> bool:
+        """判断模型是否为原生推理模型（API 返回 reasoning_content 字段）
+        
+        仅限明确通过 reasoning_content 字段返回推理的模型：
+        DeepSeek-R1/Reasoner, GLM-Z1 系列, GLM-4.7, 以及 -think 后缀的模型
+        """
+        m = model.lower()
+        return (
+            'reasoner' in m or 'r1' in m
+            or m.startswith('glm-z1')
+            or m == 'glm-4.7'
+            or m.endswith('-think')  # Duojie/Factory think 变体
+        )
+    
+    @staticmethod
+    def is_glm47(model: str) -> bool:
+        """判断是否为 GLM-4.7 模型"""
+        return model.lower() == 'glm-4.7'
+    
+    # Duojie 模型 → think 变体映射
+    # 当 Think 开关 ON 时，自动替换模型名以启用原生 Extended Thinking
+    _DUOJIE_THINK_MAP = {
+        'claude-opus-4-5-20251101': 'claude-opus-4-5-think',
+        'claude-opus-4-5-kiro': 'claude-opus-4-5-kiro',      # kiro 本身已含思考
+        'claude-opus-4-5-max': 'claude-opus-4-5-max',         # 保持不变
+        'claude-opus-4-5-think': 'claude-opus-4-5-think',     # 已是 think 变体
+        'claude-sonnet-4-5': 'claude-sonnet-4-5',             # 无已知 think 变体
+        'claude-haiku-4-5': 'claude-haiku-4-5',               # 无已知 think 变体
+    }
+    
+    @classmethod
+    def _duojie_think_model(cls, model: str) -> str:
+        """当 Think 开启时，将 Duojie 模型名映射到 think 变体"""
+        return cls._DUOJIE_THINK_MAP.get(model, model)
+    
+    # ============================================================
+    # Usage 解析
+    # ============================================================
+    
+    @staticmethod
+    def _parse_usage(usage: dict) -> dict:
+        """解析 API 返回的 usage 数据为统一格式"""
+        if not usage:
+            return {}
+        prompt_tokens = usage.get('prompt_tokens', 0)
+        cache_hit = usage.get('prompt_cache_hit_tokens', 0)
+        cache_miss = usage.get('prompt_cache_miss_tokens', 0)
+        completion = usage.get('completion_tokens', 0)
+        total = usage.get('total_tokens', 0) or (prompt_tokens + completion)
+        return {
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion,
+            'total_tokens': total,
+            'cache_hit_tokens': cache_hit,
+            'cache_miss_tokens': cache_miss,
+            'cache_hit_rate': (cache_hit / prompt_tokens) if prompt_tokens > 0 else 0,
+        }
+    
+    # ============================================================
+    # 流式传输 Chat
+    # ============================================================
+    
+    def chat_stream(self,
+                    messages: List[Dict[str, str]],
+                    model: str = 'gpt-4o-mini',
+                    provider: str = 'openai',
+                    temperature: float = 0.3,
+                    max_tokens: Optional[int] = None,
+                    tools: Optional[List[dict]] = None,
+                    tool_choice: str = 'auto',
+                    enable_thinking: bool = True) -> Generator[Dict[str, Any], None, None]:
+        """流式 Chat API
+        
+        Yields:
+            {"type": "content", "content": str}  # 内容片段
+            {"type": "tool_call", "tool_call": dict}  # 工具调用
+            {"type": "thinking", "content": str}  # 思考内容（DeepSeek）
+            {"type": "done", "finish_reason": str}  # 完成
+            {"type": "error", "error": str}  # 错误
+        """
+        if not HAS_REQUESTS:
+            yield {"type": "error", "error": "需要安装 requests 库"}
+            return
+        
+        provider = (provider or 'openai').lower()
+        api_key = self._get_api_key(provider)
+        
+        # Ollama 不需要 API Key 验证
+        if provider != 'ollama' and not api_key:
+            yield {"type": "error", "error": f"缺少 {self._get_vendor_name(provider)} API Key"}
+            return
+        
+        api_url = self._get_api_url(provider)
+        
+        payload = {
+            'model': model,
+            'messages': messages,
+            'temperature': temperature,
+            'stream': True,
+            # 必须加 stream_options 才能在流式响应中获取 usage 统计
+            'stream_options': {'include_usage': True},
+        }
+        if max_tokens:
+            payload['max_tokens'] = max_tokens
+        
+        # GLM-4.7 专属参数（仅原生 GLM 接口）：深度思考 + 流式工具调用
+        if self.is_glm47(model) and provider == 'glm' and enable_thinking:
+            payload['thinking'] = {'type': 'enabled'}
+            if tools:
+                payload['tool_stream'] = True
+        
+        # Duojie 中转：当 Think 开启时，自动映射到 think 模型变体
+        if provider == 'duojie' and enable_thinking:
+            actual_model = self._duojie_think_model(model)
+            if actual_model != model:
+                payload['model'] = actual_model
+                print(f"[AI Client] Duojie Think: {model} -> {actual_model}")
+        
+        # DeepSeek / OpenAI prompt caching 自动启用（保持前缀稳定即可命中）
+        
+        # Ollama 的工具调用支持（如果模型支持）
+        if tools:
+            payload['tools'] = tools
+            payload['tool_choice'] = tool_choice
+        
+        # 构建请求头
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'text/event-stream',
+        }
+        
+        # Ollama 不需要 Authorization 头
+        if provider != 'ollama':
+            headers['Authorization'] = f'Bearer {api_key}'
+        
+        # 重试逻辑
+        print(f"[AI Client] Requesting {api_url} with model {model}")
+        for attempt in range(self._max_retries):
+            try:
+                with requests.post(
+                    api_url,
+                    json=payload,
+                    headers=headers,
+                    stream=True,
+                    timeout=(10, self._chunk_timeout),  # (连接超时, 读取超时)
+                    proxies={'http': None, 'https': None}
+                ) as response:
+                    # 强制 UTF-8 编码（requests 对 text/event-stream 默认 ISO-8859-1，会导致中文乱码）
+                    response.encoding = 'utf-8'
+                    print(f"[AI Client] Response status: {response.status_code}")
+                    
+                    if response.status_code != 200:
+                        try:
+                            err = response.json()
+                            err_msg = err.get('error', {}).get('message', response.text)
+                        except:
+                            err_msg = response.text
+                        print(f"[AI Client] Error: {err_msg}")
+                        
+                        # 5xx 服务端错误（502/503/529 等）可重试
+                        if response.status_code >= 500 and attempt < self._max_retries - 1:
+                            wait = self._retry_delay * (attempt + 1)
+                            print(f"[AI Client] Server error {response.status_code}, retrying in {wait}s...")
+                            time.sleep(wait)
+                            continue  # 重试
+                        
+                        yield {"type": "error", "error": f"HTTP {response.status_code}: {err_msg}"}
+                        return
+                    
+                    # 解析 SSE 流
+                    tool_calls_buffer = {}  # 缓存工具调用片段
+                    pending_usage = {}  # 收集 usage 数据
+                    last_finish_reason = None
+                    
+                    # ── 使用 iter_content + 增量解码器 + 手动分行 ──
+                    # 比 iter_lines() 更健壮：
+                    #   1. iter_content() 返回 HTTP body 原始字节块
+                    #   2. 增量解码器正确处理跨 chunk 切断的多字节 UTF-8
+                    #   3. 手动按 \n 分行，避免 requests 内部分行时的编码干扰
+                    import codecs
+                    _utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='ignore')
+                    _line_buf = ""  # 解码后、尚未遇到 \n 的文本缓冲
+                    
+                    def _process_sse_line(line):
+                        """处理单行 SSE data，返回要 yield 的 dict 列表"""
+                        nonlocal tool_calls_buffer, pending_usage, last_finish_reason
+                        results = []
+                        
+                        if not line.startswith('data: '):
+                            return results
+                        
+                        data_str = line[6:]
+                        
+                        if data_str.strip() == '[DONE]':
+                            print(f"[AI Client] Received [DONE], usage={pending_usage}")
+                            results.append({"type": "done", "finish_reason": last_finish_reason or "stop", "usage": pending_usage})
+                            return results
+                        
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            return results
+                        
+                        choices = data.get('choices', [])
+                        usage_data = data.get('usage')
+                        
+                        # usage-only chunk
+                        if usage_data:
+                            pending_usage = self._parse_usage(usage_data)
+                        
+                        if not choices:
+                            return results
+                        
+                        choice = choices[0]
+                        delta = choice.get('delta', {})
+                        finish_reason = choice.get('finish_reason')
+                        
+                        # 思考内容
+                        if 'reasoning_content' in delta and delta['reasoning_content']:
+                            results.append({"type": "thinking", "content": delta['reasoning_content']})
+                        
+                        # 普通内容
+                        if 'content' in delta and delta['content']:
+                            results.append({"type": "content", "content": delta['content']})
+                        
+                        # 工具调用
+                        if 'tool_calls' in delta:
+                            for tc in delta['tool_calls']:
+                                idx = tc.get('index', 0)
+                                tc_id = tc.get('id', '')
+                                
+                                if tc_id and idx in tool_calls_buffer:
+                                    existing_id = tool_calls_buffer[idx].get('id', '')
+                                    if existing_id and existing_id != tc_id:
+                                        idx = max(tool_calls_buffer.keys()) + 1
+                                
+                                if idx not in tool_calls_buffer:
+                                    tool_calls_buffer[idx] = {
+                                        'id': tc_id,
+                                        'type': 'function',
+                                        'function': {'name': '', 'arguments': ''}
+                                    }
+                                
+                                if tc_id:
+                                    tool_calls_buffer[idx]['id'] = tc_id
+                                if 'function' in tc:
+                                    fn = tc['function']
+                                    if 'name' in fn and fn['name']:
+                                        tool_calls_buffer[idx]['function']['name'] = fn['name']
+                                    if 'arguments' in fn:
+                                        tool_calls_buffer[idx]['function']['arguments'] += fn['arguments']
+                        
+                        # 完成（先发送工具调用，但不 return，等后续 usage chunk / [DONE]）
+                        if finish_reason:
+                            if tool_calls_buffer:
+                                for idx_k in sorted(tool_calls_buffer.keys()):
+                                    results.append({"type": "tool_call", "tool_call": tool_calls_buffer[idx_k]})
+                                tool_calls_buffer = {}
+                            last_finish_reason = finish_reason
+                        
+                        return results
+                    
+                    # ── 主循环：读取原始字节块 → 解码 → 分行 → 处理 ──
+                    _should_return = False
+                    for raw_chunk in response.iter_content(chunk_size=4096, decode_unicode=False):
+                        if not raw_chunk:
+                            continue
+                        
+                        if self._stop_event.is_set():
+                            yield {"type": "stopped", "message": "用户停止了请求"}
+                            return
+                        
+                        # 增量解码：跨 chunk 的多字节 UTF-8 字符在此正确拼合
+                        decoded = _utf8_decoder.decode(raw_chunk)
+                        _line_buf += decoded
+                        
+                        # 逐行分割并处理
+                        while '\n' in _line_buf:
+                            one_line, _line_buf = _line_buf.split('\n', 1)
+                            one_line = one_line.rstrip('\r')
+                            if not one_line:
+                                continue
+                            
+                            for item in _process_sse_line(one_line):
+                                yield item
+                                if item.get('type') == 'done':
+                                    _should_return = True
+                        
+                        if _should_return:
+                            return
+                    
+                    # 处理缓冲区残留（流结束时没有以 \n 结尾的尾行）
+                    _line_buf += _utf8_decoder.decode(b'', final=True)
+                    if _line_buf.strip():
+                        for item in _process_sse_line(_line_buf.strip()):
+                            yield item
+                            if item.get('type') == 'done':
+                                return
+                    
+                    # 流结束但没有收到 [DONE]
+                    if tool_calls_buffer:
+                        for idx in sorted(tool_calls_buffer.keys()):
+                            yield {"type": "tool_call", "tool_call": tool_calls_buffer[idx]}
+                    yield {"type": "done", "finish_reason": last_finish_reason or "stop", "usage": pending_usage}
+                    return
+                    
+            except requests.exceptions.Timeout:
+                if attempt < self._max_retries - 1:
+                    time.sleep(self._retry_delay * (attempt + 1))
+                    continue
+                yield {"type": "error", "error": f"请求超时（已重试 {self._max_retries} 次）"}
+                return
+            except requests.exceptions.ConnectionError as e:
+                if attempt < self._max_retries - 1:
+                    time.sleep(self._retry_delay * (attempt + 1))
+                    continue
+                yield {"type": "error", "error": f"连接错误: {str(e)}"}
+                return
+            except Exception as e:
+                yield {"type": "error", "error": f"请求失败: {str(e)}"}
+                return
+
+    # ============================================================
+    # 非流式 Chat（保留兼容性）
+    # ============================================================
+    
+    def chat(self,
+             messages: List[Dict[str, str]],
+             model: str = 'gpt-4o-mini',
+             provider: str = 'openai',
+             temperature: float = 0.3,
+             max_tokens: Optional[int] = None,
+             timeout: int = 60,
+             tools: Optional[List[dict]] = None,
+             tool_choice: str = 'auto') -> Dict[str, Any]:
+        """非流式 Chat（兼容旧接口）"""
+        
+        if not HAS_REQUESTS:
+            return {'ok': False, 'error': '需要安装 requests 库'}
+        
+        provider = (provider or 'openai').lower()
+        api_key = self._get_api_key(provider)
+        if not api_key:
+            return {'ok': False, 'error': f'缺少 API Key'}
+        
+        payload = {
+            'model': model,
+            'messages': messages,
+            'temperature': temperature,
+        }
+        if max_tokens:
+            payload['max_tokens'] = max_tokens
+        
+        # GLM-4.7 专属参数（仅原生 GLM 接口）
+        if self.is_glm47(model) and provider == 'glm':
+            payload['thinking'] = {'type': 'enabled'}
+        
+        # DeepSeek / OpenAI prompt caching 自动启用
+        
+        if tools:
+            payload['tools'] = tools
+            payload['tool_choice'] = tool_choice
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {api_key}',
+        }
+        
+        for attempt in range(self._max_retries):
+            try:
+                response = requests.post(
+                    self._get_api_url(provider),
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout,
+                    proxies={'http': None, 'https': None}
+                )
+                response.raise_for_status()
+                obj = response.json()
+                
+                choice = obj.get('choices', [{}])[0]
+                message = choice.get('message', {})
+                
+                return {
+                    'ok': True,
+                    'content': message.get('content'),
+                    'tool_calls': message.get('tool_calls'),
+                    'finish_reason': choice.get('finish_reason'),
+                    'usage': self._parse_usage(obj.get('usage', {})),
+                    'raw': obj
+                }
+            except requests.exceptions.Timeout:
+                if attempt < self._max_retries - 1:
+                    time.sleep(self._retry_delay)
+                    continue
+                return {'ok': False, 'error': '请求超时'}
+            except Exception as e:
+                if attempt < self._max_retries - 1:
+                    time.sleep(self._retry_delay)
+                    continue
+                return {'ok': False, 'error': str(e)}
+        
+        return {'ok': False, 'error': '请求失败'}
+
+    # ============================================================
+    # Agent Loop（流式版本）
+    # ============================================================
+    
+    def agent_loop_stream(self,
+                          messages: List[Dict[str, Any]],
+                          model: str = 'gpt-4o-mini',
+                          provider: str = 'openai',
+                          max_iterations: int = 15,
+                          temperature: float = 0.3,
+                          max_tokens: Optional[int] = None,
+                          enable_thinking: bool = True,
+                          on_content: Optional[Callable[[str], None]] = None,
+                          on_thinking: Optional[Callable[[str], None]] = None,
+                          on_tool_call: Optional[Callable[[str, dict], None]] = None,
+                          on_tool_result: Optional[Callable[[str, dict, dict], None]] = None) -> Dict[str, Any]:
+        """流式 Agent Loop
+        
+        Args:
+            enable_thinking: 是否启用思考模式（影响原生推理模型的 thinking 参数）
+            on_content: 内容回调 (content) -> None
+            on_thinking: 思考回调 (content) -> None
+            on_tool_call: 工具调用开始回调 (name, args) -> None
+            on_tool_result: 工具结果回调 (name, args, result) -> None
+        
+        Returns:
+            {"ok": bool, "content": str, "tool_calls_history": list, "iterations": int}
+        """
+        if not self._tool_executor:
+            return {'ok': False, 'error': '未设置工具执行器', 'content': '', 'tool_calls_history': [], 'iterations': 0}
+        
+        working_messages = list(messages)
+        tool_calls_history = []
+        full_content = ""
+        iteration = 0
+        
+        # 累积 usage 统计（用于 cache 命中率统计）
+        total_usage = {
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
+            'total_tokens': 0,
+            'cache_hit_tokens': 0,
+            'cache_miss_tokens': 0,
+        }
+        
+        # 防止死循环：检测重复工具调用
+        recent_tool_signatures = []  # 最近的工具调用签名
+        max_tool_calls = 999  # 不限制总调用次数（仅保留连续重复检测）
+        total_tool_calls = 0
+        consecutive_same_calls = 0  # 连续相同调用计数
+        last_call_signature = None
+        server_error_retries = 0    # 连续服务端错误重试计数
+        max_server_retries = 3      # 最多重试 3 次服务端错误
+        
+        while iteration < max_iterations:
+            # 检查停止请求
+            if self._stop_event.is_set():
+                return {
+                    'ok': False,
+                    'error': '用户停止了请求',
+                    'content': full_content,
+                    'tool_calls_history': tool_calls_history,
+                    'iterations': iteration,
+                    'stopped': True,
+                    'usage': total_usage
+                }
+            
+            iteration += 1
+            
+            # 收集本轮的内容和工具调用
+            round_content = ""
+            round_thinking = ""
+            round_tool_calls = []
+            should_retry = False  # 错误恢复标志
+            should_abort = False  # 不可恢复错误标志
+            abort_error = ""
+            
+            # 发送前清洗消息（修复 tool_call_id 缺失等问题）
+            working_messages = self._sanitize_working_messages(working_messages)
+            
+            # ⚠️ 主动防御：每轮迭代前检查 working_messages 大小
+            # agent loop 多轮后工具结果会不断累积，如果不提前压缩会导致 API 报错
+            if iteration > 1 and len(working_messages) > 20:
+                # 压缩中间的长消息（不改变消息数量，只压缩内容）
+                for i, m in enumerate(working_messages):
+                    if i == 0:  # 跳过 system 消息
+                        continue
+                    c = m.get('content', '')
+                    role = m.get('role', '')
+                    if role == 'tool' and len(c) > 500:
+                        m['content'] = c[:500] + '...[已截断]'
+                    elif role == 'assistant' and len(c) > 800 and i < len(working_messages) - 3:
+                        # 只压缩非最近3条的 assistant 消息
+                        m['content'] = c[:800] + '...[已截断]'
+            
+            # 流式请求
+            for chunk in self.chat_stream(
+                messages=working_messages,
+                model=model,
+                provider=provider,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=HOUDINI_TOOLS,
+                tool_choice='auto',
+                enable_thinking=enable_thinking
+            ):
+                # 检查停止请求
+                if self._stop_event.is_set():
+                    return {
+                        'ok': False,
+                        'error': '用户停止了请求',
+                        'content': full_content + round_content,
+                        'tool_calls_history': tool_calls_history,
+                        'iterations': iteration,
+                        'stopped': True,
+                        'usage': total_usage
+                    }
+                
+                chunk_type = chunk.get('type')
+                
+                if chunk_type == 'stopped':
+                    return {
+                        'ok': False,
+                        'error': '用户停止了请求',
+                        'content': full_content + round_content,
+                        'tool_calls_history': tool_calls_history,
+                        'iterations': iteration,
+                        'stopped': True,
+                        'usage': total_usage
+                    }
+                
+                if chunk_type == 'content':
+                    content = chunk.get('content', '')
+                    # 清理XML标签（在流式输出时就清理，避免污染）
+                    import re
+                    cleaned_chunk = re.sub(r'</?tool_call[^>]*>', '', content)
+                    cleaned_chunk = re.sub(r'<arg_key>([^<]+)</arg_key>\s*<arg_value>([^<]+)</arg_value>', '', cleaned_chunk)
+                    cleaned_chunk = re.sub(r'</?arg_key[^>]*>', '', cleaned_chunk)
+                    cleaned_chunk = re.sub(r'</?arg_value[^>]*>', '', cleaned_chunk)
+                    cleaned_chunk = re.sub(r'</?redacted_reasoning[^>]*>', '', cleaned_chunk)
+                    round_content += cleaned_chunk
+                    if on_content and cleaned_chunk:
+                        on_content(cleaned_chunk)
+                
+                elif chunk_type == 'thinking':
+                    thinking_text = chunk.get('content', '')
+                    round_thinking += thinking_text
+                    if on_thinking and thinking_text:
+                        on_thinking(thinking_text)
+                
+                elif chunk_type == 'tool_call':
+                    tc = chunk.get('tool_call')
+                    print(f"[AI Client] Tool call: {tc.get('function', {}).get('name', 'unknown')}")
+                    round_tool_calls.append(tc)
+                
+                elif chunk_type == 'error':
+                    error_msg = chunk.get('error', '')
+                    error_lower = error_msg.lower()
+                    print(f"[AI Client] Agent loop error at iteration {iteration}: {error_msg}")
+                    
+                    # ---- 精确分类错误类型 ----
+                    # 1. 真正的上下文超限（API 明确告知 token 超限）
+                    is_context_exceeded = any(k in error_lower for k in (
+                        'context_length_exceeded', 'maximum context length',
+                        'max_tokens', 'token limit', 'too many tokens',
+                        'request too large', 'payload too large',
+                        'context window', 'input too long',
+                    )) or ('HTTP 413' in error_msg)
+                    
+                    # 2. 临时服务器错误（502/503/529 等，不一定与上下文大小有关）
+                    is_server_transient = any(k in error_msg for k in (
+                        'HTTP 502', 'HTTP 503', 'HTTP 529', 'no available'
+                    ))
+                    
+                    # 3. 压缩/格式问题
+                    is_format_error = ('HTTP 4' in error_msg and not is_context_exceeded and iteration > 1)
+                    is_compress_fail = '压缩失败' in error_msg
+                    
+                    is_recoverable = is_context_exceeded or is_server_transient or is_format_error or is_compress_fail
+                    
+                    if is_recoverable:
+                        server_error_retries += 1
+                        
+                        # 超过最大重试次数 → 停止
+                        if server_error_retries > max_server_retries:
+                            print(f"[AI Client] 错误已重试 {max_server_retries} 次，放弃")
+                            if on_content:
+                                on_content(f"\n[连续出错 {max_server_retries} 次，已停止重试。请稍后再试。]\n")
+                            should_abort = True
+                            abort_error = f"连续出错 {max_server_retries} 次: {error_msg}"
+                            break
+                        
+                        cleanup_count = 0
+                        
+                        if is_context_exceeded:
+                            # ---- 真正的上下文超限：渐进式裁剪 ----
+                            print(f"[AI Client] 上下文超限，进行渐进式裁剪 (第{server_error_retries}次)")
+                            if on_content:
+                                on_content(f"\n[上下文超限，正在智能裁剪后重试 ({server_error_retries}/{max_server_retries})...]\n")
+                            
+                            old_len = len(working_messages)
+                            working_messages = self._progressive_trim(
+                                working_messages, tool_calls_history,
+                                trim_level=server_error_retries  # 逐次加大裁剪力度
+                            )
+                            cleanup_count = old_len - len(working_messages)
+                            
+                        elif is_server_transient or is_compress_fail:
+                            # ---- 临时服务器错误：先等待重试，不急着裁剪 ----
+                            wait_seconds = 5 * server_error_retries
+                            if on_content:
+                                on_content(f"\n[服务端暂时不可用，{wait_seconds}秒后重试 ({server_error_retries}/{max_server_retries})...]\n")
+                            time.sleep(wait_seconds)
+                            
+                            # 只在第2次及以后重试时才裁剪（第1次纯等待重试，给服务器恢复机会）
+                            if server_error_retries >= 2:
+                                print(f"[AI Client] 服务端连续出错，尝试轻度裁剪上下文")
+                                old_len = len(working_messages)
+                                working_messages = self._progressive_trim(
+                                    working_messages, tool_calls_history,
+                                    trim_level=server_error_retries - 1  # 比上下文超限更温和
+                                )
+                                cleanup_count = old_len - len(working_messages)
+                            
+                        else:
+                            # ---- 4xx 格式问题 → 移除末尾可能有问题的消息 ----
+                            while (working_messages and cleanup_count < 20 and
+                                   working_messages[-1].get('role') in ('tool', 'system')
+                                   and working_messages[-1] is not messages[0]):
+                                working_messages.pop()
+                                cleanup_count += 1
+                            if working_messages and working_messages[-1].get('role') == 'assistant':
+                                working_messages.pop()
+                                cleanup_count += 1
+                        
+                        print(f"[AI Client] 重试 {server_error_retries}/{max_server_retries}, 移除了 {cleanup_count} 条消息")
+                        should_retry = True
+                        break  # 退出 for 循环，回到 while 循环重试
+                    
+                    # 无法恢复
+                    should_abort = True
+                    abort_error = error_msg
+                    break  # 退出 for 循环
+                
+                elif chunk_type == 'done':
+                    # 成功收到响应 → 重置服务端错误重试计数
+                    server_error_retries = 0
+                    # 收集 usage 信息（包含 cache 统计）
+                    usage = chunk.get('usage', {})
+                    if usage:
+                        total_usage['prompt_tokens'] += usage.get('prompt_tokens', 0)
+                        total_usage['completion_tokens'] += usage.get('completion_tokens', 0)
+                        total_usage['total_tokens'] += usage.get('total_tokens', 0)
+                        total_usage['cache_hit_tokens'] += usage.get('cache_hit_tokens', 0)
+                        total_usage['cache_miss_tokens'] += usage.get('cache_miss_tokens', 0)
+                    break
+            
+            # 错误恢复：跳过本轮剩余逻辑，重新请求 API
+            if should_retry:
+                full_content += round_content
+                continue  # 正确地重新进入 while 循环
+            
+            # 不可恢复错误：返回
+            if should_abort:
+                return {
+                    'ok': False,
+                    'error': abort_error,
+                    'content': full_content,
+                    'tool_calls_history': tool_calls_history,
+                    'iterations': iteration,
+                    'usage': total_usage
+                }
+            
+            # 如果没有工具调用，完成
+            if not round_tool_calls:
+                full_content += round_content
+                # 计算 cache 命中率
+                prompt_total = total_usage['cache_hit_tokens'] + total_usage['cache_miss_tokens']
+                if prompt_total > 0:
+                    total_usage['cache_hit_rate'] = total_usage['cache_hit_tokens'] / prompt_total
+                else:
+                    total_usage['cache_hit_rate'] = 0
+                return {
+                    'ok': True,
+                    'content': full_content,
+                    'tool_calls_history': tool_calls_history,
+                    'iterations': iteration,
+                    'usage': total_usage
+                }
+            
+            # 添加助手消息（确保 tool_call ID 完整）
+            self._ensure_tool_call_ids(round_tool_calls)
+            assistant_msg = {'role': 'assistant', 'tool_calls': round_tool_calls}
+            # 始终包含 content 字段（许多 API 要求存在，即使为空）
+            assistant_msg['content'] = round_content or ''
+            # reasoning_content 仅 DeepSeek / 原生 GLM 需要（Duojie 等 OpenAI 兼容代理不支持）
+            if self.is_reasoning_model(model) and provider in ('deepseek', 'glm'):
+                assistant_msg['reasoning_content'] = round_thinking or ''
+            working_messages.append(assistant_msg)
+            
+            # 执行工具调用
+            for tool_call in round_tool_calls:
+                tool_id = tool_call.get('id', '')
+                function = tool_call.get('function', {})
+                tool_name = function.get('name', '')
+                args_str = function.get('arguments', '{}')
+                
+                try:
+                    arguments = json.loads(args_str)
+                except:
+                    arguments = {}
+                
+                # ⚠️ 防止死循环：检测重复工具调用
+                total_tool_calls += 1
+                call_signature = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+                
+                # 检查总调用次数
+                if total_tool_calls > max_tool_calls:
+                    print(f"[AI Client] ⚠️ 达到最大工具调用次数限制 ({max_tool_calls})")
+                    return {
+                        'ok': True,
+                        'content': full_content + f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
+                        'tool_calls_history': tool_calls_history,
+                        'iterations': iteration,
+                        'usage': total_usage
+                    }
+                
+                # 记录调用签名（仅日志用途，不再限制连续相同调用）
+                if call_signature == last_call_signature:
+                    consecutive_same_calls += 1
+                else:
+                    consecutive_same_calls = 1
+                    last_call_signature = call_signature
+                
+                # 回调
+                if on_tool_call:
+                    on_tool_call(tool_name, arguments)
+                
+                # 执行工具
+                if tool_name == 'web_search':
+                    result = self._execute_web_search(arguments)
+                elif tool_name == 'fetch_webpage':
+                    result = self._execute_fetch_webpage(arguments)
+                elif tool_name == 'get_houdini_node_doc':
+                    # Houdini 本地文档查询也需要在主线程执行（访问 hou 模块）
+                    result = self._tool_executor(tool_name, **arguments)
+                else:
+                    # 使用 **arguments 展开字典作为关键字参数
+                    # 注意：Houdini 工具执行需要在主线程，通过队列同步
+                    result = self._tool_executor(tool_name, **arguments)
+                
+                # ⚠️ 工具调用间延迟：防止 Houdini API 调用过快导致崩溃
+                # 给 Houdini 主线程一些时间处理 UI 事件
+                import time
+                time.sleep(0.05)  # 50ms 延迟
+                
+                # 记录
+                tool_calls_history.append({
+                    'tool_name': tool_name,
+                    'arguments': arguments,
+                    'result': result
+                })
+                
+                # 回调
+                if on_tool_result:
+                    on_tool_result(tool_name, arguments, result)
+                
+                # 按行分页 + 分类压缩（查询工具分页，操作工具提取路径）
+                result_content = self._compress_tool_result(tool_name, result)
+                
+                working_messages.append({
+                    'role': 'tool',
+                    'tool_call_id': tool_id,
+                    'content': result_content
+                })
+            
+            # 多轮思考引导：在最后一条工具结果后附加提示
+            if enable_thinking and working_messages and working_messages[-1].get('role') == 'tool':
+                working_messages[-1]['content'] += (
+                    '\n\n[请先在<think>标签内分析以上执行结果和当前进度，'
+                    '检查 Todo 列表中哪些步骤已完成（用 update_todo 标记为 done），'
+                    '确认下一步计划后再继续执行。]'
+                )
+            
+            # 保存当前轮次的内容
+            full_content += round_content
+        
+        # 如果循环结束但内容为空，且有工具调用历史，强制要求生成总结
+        if not full_content.strip() and tool_calls_history:
+            print("[AI Client] ⚠️ Stream模式：工具调用完成但无回复内容，强制要求生成总结")
+            # 最后一次请求，强制要求总结
+            working_messages.append({
+                'role': 'user',
+                'content': '请生成最终总结，说明已完成的操作和结果。'
+            })
+            
+            # 再次请求生成总结
+            summary_content = ""
+            for chunk in self.chat_stream(
+                messages=working_messages,
+                model=model,
+                provider=provider,
+                temperature=temperature,
+                max_tokens=max_tokens or 500,  # 限制总结长度
+                tools=None,  # 总结阶段不需要工具
+                tool_choice=None
+            ):
+                if chunk.get('type') == 'content':
+                    content = chunk.get('content', '')
+                    summary_content += content
+                    if on_content:
+                        on_content(content)
+                elif chunk.get('type') == 'done':
+                    break
+            
+            full_content = summary_content if summary_content else full_content
+        
+        print(f"[AI Client] Reached max iterations ({iteration})")
+        # 计算 cache 命中率
+        prompt_total = total_usage['cache_hit_tokens'] + total_usage['cache_miss_tokens']
+        if prompt_total > 0:
+            total_usage['cache_hit_rate'] = total_usage['cache_hit_tokens'] / prompt_total
+        else:
+            total_usage['cache_hit_rate'] = 0
+        return {
+            'ok': True,
+            'content': full_content if full_content.strip() else "(工具调用完成，但未生成回复)",
+            'tool_calls_history': tool_calls_history,
+            'iterations': iteration,
+            'usage': total_usage
+        }
+
+    def _execute_web_search(self, arguments: dict) -> dict:
+        """执行网络搜索（通用：天气/新闻/文档/任何话题）"""
+        query = arguments.get('query', '')
+        max_results = arguments.get('max_results', 5)
+        
+        if not query:
+            return {"success": False, "error": "缺少搜索关键词"}
+        
+        result = self._web_searcher.search(query, max_results)
+        
+        if result.get('success'):
+            items = result.get('results', [])
+            if not items:
+                return {"success": True, "result": f"搜索 '{query}' 未找到结果。可尝试换用不同关键词。"}
+            
+            # 格式化结果：标题 + URL + 摘要
+            lines = [f"搜索 '{query}' 的结果（来源: {result.get('source', 'Unknown')}，共 {len(items)} 条）：\n"]
+            for i, item in enumerate(items, 1):
+                lines.append(f"{i}. {item.get('title', '无标题')}")
+                lines.append(f"   URL: {item.get('url', '')}")
+                snippet = item.get('snippet', '')
+                if snippet:
+                    lines.append(f"   摘要: {snippet[:300]}")
+                lines.append("")
+            
+            lines.append("提示: 如需查看某条结果的详细内容，请用 fetch_webpage(url=...) 获取对应 URL 的网页正文（支持 start_line 翻页）。请勿用相同关键词重复搜索。")
+            
+            return {"success": True, "result": "\n".join(lines)}
+        else:
+            return {"success": False, "error": result.get('error', '搜索失败')}
+
+    def _execute_fetch_webpage(self, arguments: dict) -> dict:
+        """获取网页内容（分页返回，支持翻页）"""
+        url = arguments.get('url', '')
+        start_line = arguments.get('start_line', 1)
+        
+        if not url:
+            return {"success": False, "error": "缺少 URL"}
+        
+        # 确保 start_line 合法
+        try:
+            start_line = max(1, int(start_line))
+        except (TypeError, ValueError):
+            start_line = 1
+        
+        result = self._web_searcher.fetch_page_content(url, max_lines=80, start_line=start_line)
+        
+        if result.get('success'):
+            content = result.get('content', '')
+            return {"success": True, "result": f"网页正文（{url}）：\n\n{content}"}
+        else:
+            return {"success": False, "error": result.get('error', '获取失败')}
+
+    # 保持兼容性
+    def agent_loop(self, *args, **kwargs):
+        """兼容旧接口"""
+        return self.agent_loop_stream(*args, **kwargs)
+
+    # ============================================================
+    # JSON 解析模式（用于不支持 Function Calling 的模型）
+    # ============================================================
+    
+    def _supports_function_calling(self, provider: str, model: str) -> bool:
+        """检查模型是否支持原生 Function Calling"""
+        # Ollama 模型默认不支持
+        if provider == 'ollama':
+            return False
+        # 其他云端模型都支持
+        return True
+    
+    def _get_json_mode_system_prompt(self) -> str:
+        """获取 JSON 模式的系统提示（执行器模式）"""
+        # 构建工具列表说明
+        tool_descriptions = []
+        for tool in HOUDINI_TOOLS:
+            func = tool['function']
+            params = func.get('parameters', {}).get('properties', {})
+            required = func.get('parameters', {}).get('required', [])
+            
+            param_desc = []
+            for pname, pinfo in params.items():
+                req_mark = "(必填)" if pname in required else "(可选)"
+                param_desc.append(f"    - {pname} {req_mark}: {pinfo.get('description', '')}")
+            
+            tool_descriptions.append(f"""
+**{func['name']}** - {func['description']}
+参数:
+{chr(10).join(param_desc) if param_desc else '    无'}
+""")
+        
+        return f"""你是Houdini执行器。只执行，不思考，不解释。
+
+严格禁止（违反会浪费token）:
+-禁止生成任何思考过程、推理步骤、分析过程
+-禁止说明"为什么"、"让我先"、"我需要"
+-禁止逐步说明、分步解释
+-禁止输出任何非执行性内容
+
+只允许:
+-直接调用工具执行操作
+-直接给出执行结果(1句以内)
+-不输出任何思考内容
+
+安全操作规则（必须遵守）:
+-操作节点前先用get_network_structure确认节点存在
+-设置参数前先用get_node_details确认节点和参数存在
+-execute_python中必须检查None:node=hou.node(path);if node:...
+-创建节点后用返回的路径操作,不要猜测路径
+-连接节点前确认两个节点都已存在
+
+完成前必须检查（任务结束前强制执行）:
+-调用get_network_structure检查节点网络
+-确认所有节点已正确连接,无孤立节点
+-检查是否有错误标记的节点,有则修复
+-确认输出节点已设为显示
+-只有检查通过才能结束任务
+
+## 工具调用格式
+
+```json
+{{"tool": "工具名称", "args": {{"参数名": "参数值"}}}}
+```
+
+规则:
+1.每次只调用一个工具
+2.工具调用在独立JSON代码块中
+3.调用后等待结果再继续
+4.不解释，直接执行
+5.先查询确认再操作
+
+## 可用工具
+
+{chr(10).join(tool_descriptions)}
+
+## 示例
+
+创建节点（不解释，直接执行）:
+```json
+{{"tool": "create_node", "args": {{"node_type": "box"}}}}
+```
+"""
+    
+    def _parse_json_tool_calls(self, content: str) -> List[Dict]:
+        """从文本内容中解析 JSON 格式的工具调用（改进版：支持多种格式）"""
+        import re
+        
+        tool_calls = []
+        
+        # 1. 清理XML标签（如果AI错误输出了XML格式）
+        content = re.sub(r'</?tool_call[^>]*>', '', content)
+        content = re.sub(r'<arg_key>([^<]+)</arg_key>\s*<arg_value>([^<]+)</arg_value>', r'"\1": "\2"', content)
+        
+        # 2. 匹配 ```json ... ``` 代码块
+        json_blocks = re.findall(r'```(?:json)?\s*\n?({[^`]+})\s*\n?```', content, re.DOTALL)
+        
+        # 3. 如果没有代码块，尝试直接匹配JSON对象
+        if not json_blocks:
+            # 尝试匹配独立的JSON对象（不在代码块中）
+            json_pattern = r'\{\s*"(?:tool|name)"\s*:\s*"[^"]+"\s*,\s*"(?:args|arguments)"\s*:\s*\{[^}]+\}\s*\}'
+            json_blocks = re.findall(json_pattern, content, re.DOTALL)
+        
+        for block in json_blocks:
+            try:
+                # 清理可能的格式问题
+                block = block.strip()
+                # 修复常见的JSON格式错误
+                block = re.sub(r',\s*}', '}', block)  # 移除末尾多余逗号
+                block = re.sub(r',\s*]', ']', block)  # 移除数组末尾多余逗号
+                
+                data = json.loads(block)
+                if 'tool' in data:
+                    tool_calls.append({
+                        'name': data['tool'],
+                        'arguments': data.get('args', data.get('arguments', {}))
+                    })
+                elif 'name' in data:
+                    # 兼容 {"name": "xxx", "arguments": {...}} 格式
+                    tool_calls.append({
+                        'name': data['name'],
+                        'arguments': data.get('arguments', data.get('args', {}))
+                    })
+            except (json.JSONDecodeError, KeyError) as e:
+                # 记录解析失败但不中断
+                print(f"[AI Client] JSON解析失败: {e}, 内容: {block[:100]}")
+                continue
+        
+        return tool_calls
+    
+    def agent_loop_json_mode(self,
+                              messages: List[Dict[str, Any]],
+                              model: str = 'qwen2.5:14b',
+                              provider: str = 'ollama',
+                              max_iterations: int = 15,
+                              temperature: float = 0.3,
+                              max_tokens: Optional[int] = None,
+                              enable_thinking: bool = True,
+                              on_content: Optional[Callable[[str], None]] = None,
+                              on_thinking: Optional[Callable[[str], None]] = None,
+                              on_tool_call: Optional[Callable[[str, dict], None]] = None,
+                              on_tool_result: Optional[Callable[[str, dict, dict], None]] = None) -> Dict[str, Any]:
+        """JSON 模式 Agent Loop（用于不支持 Function Calling 的模型）"""
+        
+        if not self._tool_executor:
+            return {'ok': False, 'error': '未设置工具执行器', 'content': '', 'tool_calls_history': [], 'iterations': 0}
+        
+        # 添加 JSON 模式系统提示
+        json_system_prompt = self._get_json_mode_system_prompt()
+        working_messages = []
+        
+        # 处理消息，在第一个 system 消息后追加 JSON 模式说明
+        system_found = False
+        for msg in messages:
+            if msg.get('role') == 'system' and not system_found:
+                working_messages.append({
+                    'role': 'system',
+                    'content': msg.get('content', '') + '\n\n' + json_system_prompt
+                })
+                system_found = True
+            else:
+                working_messages.append(msg)
+        
+        if not system_found:
+            working_messages.insert(0, {'role': 'system', 'content': json_system_prompt})
+        
+        tool_calls_history = []
+        full_content = ""
+        iteration = 0
+        self._json_thinking_buffer = ""  # 初始化思考缓冲区
+        
+        # 累积 usage 统计（用于 cache 命中率统计）
+        total_usage = {
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
+            'total_tokens': 0,
+            'cache_hit_tokens': 0,
+            'cache_miss_tokens': 0,
+        }
+        
+        # 防止死循环：检测重复工具调用
+        max_tool_calls = 999  # 不限制总调用次数（仅保留连续重复检测）
+        total_tool_calls = 0
+        consecutive_same_calls = 0
+        last_call_signature = None
+        server_error_retries = 0    # 连续服务端错误重试计数
+        max_server_retries = 3      # 最多重试 3 次服务端错误
+        
+        while iteration < max_iterations:
+            if self._stop_event.is_set():
+                return {
+                    'ok': False, 'error': '用户停止了请求',
+                    'content': full_content, 'tool_calls_history': tool_calls_history,
+                    'iterations': iteration, 'stopped': True, 'usage': total_usage
+                }
+            
+            iteration += 1
+            round_content = ""
+            
+            # ⚠️ 主动防御：每轮迭代前压缩过长的消息内容
+            if iteration > 1 and len(working_messages) > 20:
+                for i, m in enumerate(working_messages):
+                    if i == 0:
+                        continue
+                    c = m.get('content', '')
+                    role = m.get('role', '')
+                    if role == 'tool' and len(c) > 500:
+                        m['content'] = c[:500] + '...[已截断]'
+                    elif role == 'assistant' and len(c) > 800 and i < len(working_messages) - 3:
+                        m['content'] = c[:800] + '...[已截断]'
+            
+            # 流式请求（不传 tools 参数）
+            for chunk in self.chat_stream(
+                messages=working_messages,
+                model=model,
+                provider=provider,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=None,  # JSON 模式不使用原生工具
+                tool_choice=None
+            ):
+                if self._stop_event.is_set():
+                    return {
+                        'ok': False, 'error': '用户停止了请求',
+                        'content': full_content + round_content,
+                        'tool_calls_history': tool_calls_history,
+                        'iterations': iteration, 'stopped': True, 'usage': total_usage
+                    }
+                
+                chunk_type = chunk.get('type')
+                
+                if chunk_type == 'content':
+                    content = chunk.get('content', '')
+                    round_content += content
+                    if on_content:
+                        on_content(content)
+                
+                elif chunk_type == 'thinking':
+                    thinking_text = chunk.get('content', '')
+                    if on_thinking and thinking_text:
+                        on_thinking(thinking_text)
+                
+                elif chunk_type == 'error':
+                    err_msg = chunk.get('error', '')
+                    err_lower = err_msg.lower()
+                    
+                    # 精确分类错误
+                    is_context_exceeded = any(k in err_lower for k in (
+                        'context_length_exceeded', 'maximum context length',
+                        'max_tokens', 'token limit', 'too many tokens',
+                        'request too large', 'payload too large',
+                        'context window', 'input too long',
+                    )) or ('HTTP 413' in err_msg)
+                    is_server_transient = any(k in err_msg for k in (
+                        'HTTP 502', 'HTTP 503', 'HTTP 529', '压缩失败', 'no available'
+                    ))
+                    
+                    if is_context_exceeded or is_server_transient:
+                        server_error_retries += 1
+                        if server_error_retries > max_server_retries:
+                            if on_content:
+                                on_content(f"\n[连续出错 {max_server_retries} 次，已停止重试。]\n")
+                            return {
+                                'ok': False, 'error': f"连续出错: {err_msg}",
+                                'content': full_content, 'tool_calls_history': tool_calls_history,
+                                'iterations': iteration, 'usage': total_usage
+                            }
+                        
+                        if is_context_exceeded:
+                            # 上下文超限：立即裁剪
+                            if on_content:
+                                on_content(f"\n[上下文超限，智能裁剪后重试 ({server_error_retries}/{max_server_retries})...]\n")
+                            working_messages = self._progressive_trim(
+                                working_messages, tool_calls_history,
+                                trim_level=server_error_retries
+                            )
+                        else:
+                            # 临时服务器错误：等待，第2次开始才裁剪
+                            wait_seconds = 5 * server_error_retries
+                            if on_content:
+                                on_content(f"\n[服务端暂时不可用，{wait_seconds}秒后重试 ({server_error_retries}/{max_server_retries})...]\n")
+                            time.sleep(wait_seconds)
+                            if server_error_retries >= 2:
+                                working_messages = self._progressive_trim(
+                                    working_messages, tool_calls_history,
+                                    trim_level=server_error_retries - 1
+                                )
+                        break  # 退出 for，回到 while 重试
+                    return {
+                        'ok': False, 'error': err_msg,
+                        'content': full_content, 'tool_calls_history': tool_calls_history,
+                        'iterations': iteration, 'usage': total_usage
+                    }
+                
+                elif chunk_type == 'done':
+                    # 成功收到响应 → 重置服务端错误重试计数
+                    server_error_retries = 0
+                    # 收集 usage 信息（包含 cache 统计）
+                    usage = chunk.get('usage', {})
+                    if usage:
+                        total_usage['prompt_tokens'] += usage.get('prompt_tokens', 0)
+                        total_usage['completion_tokens'] += usage.get('completion_tokens', 0)
+                        total_usage['total_tokens'] += usage.get('total_tokens', 0)
+                        total_usage['cache_hit_tokens'] += usage.get('cache_hit_tokens', 0)
+                        total_usage['cache_miss_tokens'] += usage.get('cache_miss_tokens', 0)
+                    break
+            
+            # 清理内容中的XML标签和格式问题（更彻底的清理）
+            import re
+            cleaned_content = round_content
+            # 清理所有XML标签
+            cleaned_content = re.sub(r'</?tool_call[^>]*>', '', cleaned_content)
+            cleaned_content = re.sub(r'<arg_key>([^<]+)</arg_key>\s*<arg_value>([^<]+)</arg_value>', '', cleaned_content)
+            cleaned_content = re.sub(r'</?arg_key[^>]*>', '', cleaned_content)
+            cleaned_content = re.sub(r'</?arg_value[^>]*>', '', cleaned_content)
+            cleaned_content = re.sub(r'</?redacted_reasoning[^>]*>', '', cleaned_content)
+            # 清理其他可能的XML标签
+            cleaned_content = re.sub(r'<[^>]+>', '', cleaned_content)  # 清理所有剩余的XML标签
+            
+            # 解析 JSON 工具调用
+            tool_calls = self._parse_json_tool_calls(cleaned_content)
+            
+            # 如果没有工具调用，检查是否完成
+            if not tool_calls:
+                # 清理后的内容添加到full_content（只添加一次，避免重复）
+                if cleaned_content.strip():
+                    # 检查是否与已有内容重复（避免重复添加）
+                    if cleaned_content.strip() not in full_content:
+                        full_content += cleaned_content
+                # 如果内容为空或只有空白，检查是否需要继续
+                if not cleaned_content.strip() and tool_calls_history:
+                    # 有工具调用历史但无内容，继续循环等待总结
+                    continue
+                # 计算 cache 命中率
+                prompt_total = total_usage['cache_hit_tokens'] + total_usage['cache_miss_tokens']
+                if prompt_total > 0:
+                    total_usage['cache_hit_rate'] = total_usage['cache_hit_tokens'] / prompt_total
+                else:
+                    total_usage['cache_hit_rate'] = 0
+                return {
+                    'ok': True,
+                    'content': full_content,
+                    'tool_calls_history': tool_calls_history,
+                    'iterations': iteration,
+                    'usage': total_usage
+                }
+            
+            # 添加助手消息（使用清理后的内容，但不要重复添加到full_content）
+            json_assistant_msg = {'role': 'assistant', 'content': cleaned_content}
+            # reasoning_content 仅 DeepSeek / 原生 GLM 需要
+            if self.is_reasoning_model(model) and provider in ('deepseek', 'glm'):
+                json_assistant_msg['reasoning_content'] = ''
+            working_messages.append(json_assistant_msg)
+            
+            # 执行工具调用
+            tool_results = []
+            for tc in tool_calls:
+                tool_name = tc['name']
+                arguments = tc['arguments']
+                
+                # ⚠️ 防止死循环：检测重复工具调用
+                total_tool_calls += 1
+                call_signature = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+                
+                # 检查总调用次数
+                if total_tool_calls > max_tool_calls:
+                    print(f"[AI Client] ⚠️ JSON模式：达到最大工具调用次数限制 ({max_tool_calls})")
+                    return {
+                        'ok': True,
+                        'content': full_content + f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
+                        'tool_calls_history': tool_calls_history,
+                        'iterations': iteration
+                    }
+                
+                # 记录调用签名（仅日志用途，不再限制连续相同调用）
+                if call_signature == last_call_signature:
+                    consecutive_same_calls += 1
+                else:
+                    consecutive_same_calls = 1
+                    last_call_signature = call_signature
+                
+                if on_tool_call:
+                    on_tool_call(tool_name, arguments)
+                
+                # 检查工具执行器是否设置
+                if not self._tool_executor:
+                    result = {
+                        "success": False,
+                        "error": f"工具执行器未设置，无法执行工具: {tool_name}"
+                    }
+                else:
+                    # 执行工具
+                    try:
+                        if tool_name == 'web_search':
+                            result = self._execute_web_search(arguments)
+                        elif tool_name == 'fetch_webpage':
+                            result = self._execute_fetch_webpage(arguments)
+                        elif tool_name == 'get_houdini_node_doc':
+                            result = self._tool_executor(tool_name, **arguments)
+                        else:
+                            result = self._tool_executor(tool_name, **arguments)
+                    except Exception as e:
+                        import traceback
+                        result = {
+                            "success": False,
+                            "error": f"工具执行异常: {str(e)}\n{traceback.format_exc()[:200]}"
+                        }
+                
+                # ⚠️ 工具调用间延迟：防止 Houdini API 调用过快导致崩溃
+                import time
+                time.sleep(0.05)  # 50ms 延迟
+                
+                tool_calls_history.append({
+                    'tool_name': tool_name,
+                    'arguments': arguments,
+                    'result': result
+                })
+                
+                # 如果工具执行失败，记录详细错误（帮助调试）
+                if not result.get('success'):
+                    error_detail = result.get('error', '未知错误')
+                    print(f"[AI Client] ⚠️ 工具执行失败: {tool_name}")
+                    print(f"[AI Client]   错误详情: {error_detail[:200]}")
+                
+                if on_tool_result:
+                    on_tool_result(tool_name, arguments, result)
+                
+                # 按行分页 + 分类压缩
+                compressed = self._compress_tool_result(tool_name, result)
+                if result.get('success'):
+                    tool_results.append(f"{tool_name}:{compressed}")
+                else:
+                    tool_results.append(f"{tool_name}:错误:{compressed}")
+            
+            # 极简格式：工具结果，继续或总结
+            # 检查是否有工具执行失败
+            has_failed_tools = any('错误:' in r for r in tool_results)
+            # 检查是否有未完成的todo（通过检查工具调用历史）
+            has_pending_todos = False
+            for tc in tool_calls_history:
+                if tc.get('tool_name') == 'add_todo':
+                    # 如果有add_todo但没有对应的update_todo done，说明还有未完成的任务
+                    has_pending_todos = True
+                    break
+            
+            # 构造提示（带多轮思考引导）
+            think_hint = '先在<think>标签内分析执行结果和当前进度，再决定下一步。' if enable_thinking else ''
+            
+            todo_hint = '已完成的步骤请立即用 update_todo 标记为 done。'
+            if has_failed_tools:
+                prompt = '|'.join(tool_results) + f'|有工具执行失败，{think_hint}{todo_hint}请检查错误信息并继续完成任务。不要因为失败就提前结束。'
+            elif has_pending_todos and iteration < max_iterations - 2:
+                prompt = '|'.join(tool_results) + f'|检测到还有未完成的任务，{think_hint}{todo_hint}请继续执行。'
+            elif iteration >= max_iterations - 1:
+                prompt = '|'.join(tool_results) + f'|{todo_hint}请生成最终总结，说明已完成的操作'
+            else:
+                prompt = '|'.join(tool_results) + f'|{think_hint}{todo_hint}继续或总结'
+            
+            # 使用 system 角色传递工具结果，避免与用户消息混淆
+            # 注意：部分模型不支持多个 system 消息，此处使用明确的 [TOOL_RESULT] 标记
+            working_messages.append({
+                'role': 'user',
+                'content': f'[TOOL_RESULT]\n{prompt}'
+            })
+            
+            # 保存当前轮次的内容（清理XML标签，避免重复）
+            import re
+            cleaned_round = round_content
+            # 更彻底的XML标签清理
+            cleaned_round = re.sub(r'</?tool_call[^>]*>', '', cleaned_round)
+            cleaned_round = re.sub(r'<arg_key>([^<]+)</arg_key>\s*<arg_value>([^<]+)</arg_value>', '', cleaned_round)
+            cleaned_round = re.sub(r'</?arg_key[^>]*>', '', cleaned_round)
+            cleaned_round = re.sub(r'</?arg_value[^>]*>', '', cleaned_round)
+            cleaned_round = re.sub(r'</?redacted_reasoning[^>]*>', '', cleaned_round)
+            cleaned_round = re.sub(r'<[^>]+>', '', cleaned_round)  # 清理所有剩余的XML标签
+            # 只添加非空且不重复的内容
+            if cleaned_round.strip():
+                # 检查是否与已有内容重复（简单去重：如果内容完全相同，跳过）
+                if cleaned_round.strip() not in full_content:
+                    full_content += cleaned_round
+                else:
+                    # 如果内容重复，只添加一次（避免多次重复）
+                    pass
+        
+        # 如果循环结束但内容为空，且有工具调用历史，强制要求生成总结
+        if not full_content.strip() and tool_calls_history:
+            print("[AI Client] ⚠️ JSON模式：工具调用完成但无回复内容，强制要求生成总结")
+            # 最后一次请求，强制要求总结
+            working_messages.append({
+                'role': 'user',
+                'content': '请生成最终总结，说明已完成的操作和结果。'
+            })
+            
+            # 再次请求生成总结
+            summary_content = ""
+            for chunk in self.chat_stream(
+                messages=working_messages,
+                model=model,
+                provider=provider,
+                temperature=temperature,
+                max_tokens=max_tokens or 500,  # 限制总结长度
+                tools=None,
+                tool_choice=None
+            ):
+                if chunk.get('type') == 'content':
+                    content = chunk.get('content', '')
+                    summary_content += content
+                    if on_content:
+                        on_content(content)
+                elif chunk.get('type') == 'done':
+                    break
+            
+            full_content = summary_content if summary_content else full_content
+        
+        # 计算 cache 命中率
+        prompt_total = total_usage['cache_hit_tokens'] + total_usage['cache_miss_tokens']
+        if prompt_total > 0:
+            total_usage['cache_hit_rate'] = total_usage['cache_hit_tokens'] / prompt_total
+        else:
+            total_usage['cache_hit_rate'] = 0
+        return {
+            'ok': True,
+            'content': full_content if full_content.strip() else "(工具调用完成，但未生成回复)",
+            'tool_calls_history': tool_calls_history,
+            'iterations': iteration,
+            'usage': total_usage
+        }
+    
+    def agent_loop_auto(self,
+                        messages: List[Dict[str, Any]],
+                        model: str = 'gpt-4o-mini',
+                        provider: str = 'openai',
+                        **kwargs) -> Dict[str, Any]:
+        """自动选择合适的 Agent Loop 模式"""
+        if self._supports_function_calling(provider, model):
+            return self.agent_loop_stream(messages=messages, model=model, provider=provider, **kwargs)
+        else:
+            return self.agent_loop_json_mode(messages=messages, model=model, provider=provider, **kwargs)
+
+
+# 兼容旧代码
+OpenAIClient = AIClient
