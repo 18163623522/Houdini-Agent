@@ -16,6 +16,9 @@ cache/
 *.swp
 *.swo
 
+# Config (contains API keys)
+config/houdini_ai.ini
+
 # OS
 Thumbs.db
 .DS_Store
