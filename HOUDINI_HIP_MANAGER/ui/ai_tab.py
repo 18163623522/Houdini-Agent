@@ -1667,52 +1667,64 @@ Todo 管理规则（严格遵守）:
         if resp:
             resp.finalize()
         
-        # 记录工具调用历史到对话历史（重要：保存节点操作上下文）
+        # 记录工具调用历史 + AI 回复到对话历史
+        # ⚠️ 关键设计：合并为一条 assistant 消息，避免连续 assistant 破坏 user/assistant 交替
+        # 参考 ChatGPT / Cursor 做法：保留工具名+关键参数+结果，让模型下一轮能理解上一轮做了什么
         tool_calls_history = result.get('tool_calls_history', [])
+        tool_summary_text = ""
         if tool_calls_history:
             tool_summary_parts = []
             for tool_call in tool_calls_history:
                 tool_name = tool_call.get('tool_name', '')
+                tool_args = tool_call.get('arguments', {})
                 tool_result = tool_call.get('result', {})
+                
+                # 格式：tool_name(key_args) → result（保留参数信息，让模型能参考）
+                args_brief = self._format_tool_args_brief(tool_name, tool_args)
                 
                 if tool_result.get('success'):
                     result_text = str(tool_result.get('result', ''))
-                    if tool_name in ('create_node', 'create_nodes_batch', 'connect_nodes', 'set_node_parameter'):
-                        paths = re.findall(r'[/\w]+(?:/[\w]+)+', result_text)
+                    # 提取路径等关键信息
+                    if tool_name in ('create_node', 'create_nodes_batch', 'connect_nodes', 
+                                     'set_node_parameter', 'create_wrangle_node'):
+                        paths = re.findall(r'/[\w/]+', result_text)
                         if paths:
                             result_text = ' '.join(paths[:3])
-                            if len(result_text) > 100:
-                                result_text = result_text[:100] + '...'
-                        elif len(result_text) > 80:
-                            result_text = result_text[:80]
-                    elif len(result_text) > 80:
-                        keywords = re.findall(r'[/\w]+|[\d.]+|创建|成功|完成', result_text)
-                        result_text = ' '.join(keywords[:5]) if keywords else result_text[:80]
-                    tool_summary_parts.append(f"[ok] {tool_name}: {result_text}")
+                        elif len(result_text) > 120:
+                            result_text = result_text[:120] + '...'
+                    elif len(result_text) > 120:
+                        result_text = result_text[:120] + '...'
+                    tool_summary_parts.append(f"[ok] {tool_name}({args_brief}) → {result_text}")
                 else:
-                    error_t = str(tool_result.get('error', ''))[:80]
-                    tool_summary_parts.append(f"[err] {tool_name}: {error_t}")
+                    error_t = str(tool_result.get('error', ''))[:100]
+                    tool_summary_parts.append(f"[err] {tool_name}({args_brief}) → {error_t}")
             
             if tool_summary_parts:
-                history.append({
-                    'role': 'assistant',
-                    'content': f"[工具执行结果]\n" + "\n".join(tool_summary_parts)
-                })
+                tool_summary_text = "[工具执行结果]\n" + "\n".join(tool_summary_parts)
         
-        # 记录 AI 回复到历史（thinking 单独保存，便于恢复时渲染折叠区）
+        # 提取 AI 回复内容
         content = result.get('content', '')
+        clean_content = ""
+        thinking_text = ""
         if content:
-            # 提取 thinking 内容
             thinking_parts = re.findall(r'<think>([\s\S]*?)</think>', content)
             thinking_text = '\n'.join(thinking_parts).strip() if thinking_parts else ''
-            # 正式回复（去除 think 标签）
-            clean = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
-            clean = self._strip_fake_tool_results(clean)
-            if clean or thinking_text:
-                msg = {'role': 'assistant', 'content': clean}
-                if thinking_text:
-                    msg['thinking'] = thinking_text
-                history.append(msg)
+            clean_content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            clean_content = self._strip_fake_tool_results(clean_content)
+        
+        # 合并为一条 assistant 消息（工具摘要 + AI 回复）
+        # 这样保持 user → assistant → user → assistant 严格交替
+        combined_parts = []
+        if tool_summary_text:
+            combined_parts.append(tool_summary_text)
+        if clean_content:
+            combined_parts.append(clean_content)
+        
+        if combined_parts:
+            msg = {'role': 'assistant', 'content': '\n\n'.join(combined_parts)}
+            if thinking_text:
+                msg['thinking'] = thinking_text
+            history.append(msg)
         
         # 管理上下文
         self._manage_context()
@@ -2001,6 +2013,83 @@ Todo 管理规则（严格遵守）:
         re.MULTILINE | re.IGNORECASE,
     )
 
+    @staticmethod
+    def _fix_message_alternation(messages: list) -> list:
+        """修复消息交替问题：合并连续的相同角色消息
+        
+        OpenAI API 规范要求 user/assistant 严格交替。
+        ChatGPT/Cursor 也遵循这个规范。连续的 assistant 或 user 消息
+        会导致部分 provider（尤其是中转 API）行为异常或丢失上下文。
+        """
+        if not messages:
+            return messages
+        
+        fixed = [messages[0]]
+        for msg in messages[1:]:
+            role = msg.get('role', '')
+            prev_role = fixed[-1].get('role', '')
+            
+            if role == prev_role and role in ('user', 'assistant'):
+                # 合并连续的相同角色消息
+                prev_content = fixed[-1].get('content', '')
+                curr_content = msg.get('content', '')
+                fixed[-1] = fixed[-1].copy()
+                fixed[-1]['content'] = prev_content + '\n\n' + curr_content
+                # 合并 thinking 字段（如果有）
+                if 'thinking' in msg and msg['thinking']:
+                    prev_thinking = fixed[-1].get('thinking', '')
+                    fixed[-1]['thinking'] = (prev_thinking + '\n' + msg['thinking']).strip()
+            else:
+                fixed.append(msg)
+        
+        return fixed
+
+    @staticmethod
+    def _format_tool_args_brief(tool_name: str, args: dict) -> str:
+        """格式化工具参数摘要，保留关键参数让模型能参考上一轮调用
+        
+        对比 ChatGPT/Cursor：它们保留完整参数，但我们需要控制 token。
+        折中方案：只保留最关键的参数，限制总长度。
+        """
+        if not args:
+            return ""
+        
+        # 不同工具的关键参数（按重要性排序）
+        _KEY_PARAMS = {
+            'create_node': ['node_type', 'parent_path', 'node_name'],
+            'create_wrangle_node': ['wrangle_type', 'node_name', 'run_over'],
+            'create_nodes_batch': ['nodes'],
+            'connect_nodes': ['from_path', 'to_path', 'input_index'],
+            'set_node_parameter': ['node_path', 'param_name', 'value'],
+            'get_node_parameters': ['node_path'],
+            'get_node_details': ['node_path'],
+            'get_network_structure': ['network_path'],
+            'set_display_flag': ['node_path', 'display', 'render'],
+            'execute_python': ['code'],
+            'execute_shell': ['command'],
+            'search_node_types': ['keyword'],
+            'web_search': ['query'],
+            'fetch_webpage': ['url'],
+            'check_errors': ['node_path'],
+            'run_skill': ['skill_name'],
+        }
+        
+        key_params = _KEY_PARAMS.get(tool_name, list(args.keys())[:3])
+        parts = []
+        for k in key_params:
+            if k in args:
+                v = args[k]
+                v_str = str(v)
+                # 代码类参数只取前 60 字符
+                if k in ('code', 'vex_code', 'command') and len(v_str) > 60:
+                    v_str = v_str[:60] + '...'
+                elif len(v_str) > 80:
+                    v_str = v_str[:80] + '...'
+                parts.append(f'{k}={v_str}')
+        
+        brief = ', '.join(parts)
+        return brief[:200] if len(brief) > 200 else brief  # 总长度限制
+
     def _strip_fake_tool_results(self, text: str) -> str:
         """检测并移除 AI 伪造的工具调用结果文本。
         
@@ -2288,8 +2377,8 @@ Todo 管理规则（严格遵守）:
             # ⚠️ 为了 cache 命中率，历史消息应保持稳定
             # ⚠️ 过滤掉不完整的 tool 消息（缺少 tool_call_id 会导致 API 400 错误）
             # ⚠️ 关键：每条 user 消息后必须有 assistant 回复，不能出现连续 user
-            _HOUDINI_KW = ('错误', 'error', '成功', '完成', '创建', '删除', '连接', '节点')
-            _MAX_SUMMARY = 120  # 非关键 assistant 消息的摘要长度
+            _HOUDINI_KW = ('错误', 'error', '成功', '完成', '创建', '删除', '连接', '节点', '工具执行结果')
+            _MAX_SUMMARY = 400  # assistant 消息摘要阈值（提高以保留更多上下文）
             
             history_to_send = []
             for msg in self._conversation_history:
@@ -2311,9 +2400,15 @@ Todo 管理规则（严格遵守）:
                 elif role == 'assistant':
                     full_content = msg.get('content', '')
                     
-                    # 工具结果摘要：始终原样保留（已是压缩格式）
-                    if full_content.startswith('[工具执行结果]') or full_content.startswith('[工具结果]'):
-                        history_to_send.append(msg)
+                    # 包含工具执行结果的消息：保留更多内容（关键上下文）
+                    if '[工具执行结果]' in full_content or '[工具结果]' in full_content:
+                        if len(full_content) <= 800:
+                            history_to_send.append(msg)
+                        else:
+                            # 工具结果部分尽量保留，截断过长的自然语言部分
+                            compressed_msg = msg.copy()
+                            compressed_msg['content'] = full_content[:800] + '...'
+                            history_to_send.append(compressed_msg)
                         continue
                     
                     # 短消息（<=_MAX_SUMMARY 字符）：原样保留
@@ -2324,14 +2419,14 @@ Todo 管理规则（严格遵守）:
                     # 长消息：智能压缩
                     content_lower = full_content.lower()
                     if any(kw in content_lower for kw in _HOUDINI_KW):
-                        # Houdini 操作相关 → 提取关键行
+                        # Houdini 操作相关 → 提取关键行（增加保留行数）
                         lines = [l.strip() for l in full_content.split('\n') if l.strip()]
                         key_lines = [l for l in lines if any(
                             k in l.lower() for k in _HOUDINI_KW
                         )]
                         if key_lines:
                             compressed_msg = msg.copy()
-                            compressed_msg['content'] = '\n'.join(key_lines[:3])
+                            compressed_msg['content'] = '\n'.join(key_lines[:6])  # 保留更多关键行
                             history_to_send.append(compressed_msg)
                         else:
                             compressed_msg = msg.copy()
@@ -2342,6 +2437,11 @@ Todo 管理规则（严格遵守）:
                         compressed_msg = msg.copy()
                         compressed_msg['content'] = full_content[:_MAX_SUMMARY] + '...'
                         history_to_send.append(compressed_msg)
+            
+            # ⚠️ 修复 user/assistant 交替问题
+            # OpenAI API 规范要求 user/assistant 严格交替（tool 消息除外）
+            # 连续的相同角色消息会导致某些 provider（如 duojie 中转）行为异常
+            history_to_send = self._fix_message_alternation(history_to_send)
             
             messages.extend(history_to_send)
             
