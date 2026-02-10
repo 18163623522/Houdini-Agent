@@ -1774,10 +1774,18 @@ Todo 管理规则（严格遵守）:
         else:
             self.todo_list.update_todo(todo_id, status)
 
+    # 不需要 Houdini 主线程的工具集合（纯 Python / 系统操作，可在后台线程直接执行）
+    _BG_SAFE_TOOLS = frozenset({
+        'execute_shell',       # subprocess.run，不依赖 hou
+        'search_local_doc',    # 纯 Python 文本检索
+        'list_skills',         # 纯 Python 列表
+    })
+
     def _execute_tool_with_todo(self, tool_name: str, **kwargs) -> dict:
         """执行工具，包含 Todo 相关的工具
         
-        注意：此方法在后台线程调用，Houdini 操作必须通过信号调度到主线程执行
+        注意：此方法在后台线程调用，Houdini 操作必须通过信号调度到主线程执行。
+        不依赖 hou 模块的工具（execute_shell 等）直接在后台线程执行，避免阻塞 UI。
         """
         # 处理 Todo 相关工具（纯 Python 操作，线程安全）
         if tool_name == "add_todo":
@@ -1797,8 +1805,23 @@ Todo 管理规则（严格遵守）:
             # 需要在主线程执行 Houdini 操作
             return self._execute_tool_in_main_thread(tool_name, kwargs)
         
+        # 不依赖 hou 的工具 → 直接在后台线程执行（避免阻塞 UI）
+        if tool_name in self._BG_SAFE_TOOLS:
+            return self._execute_tool_in_bg(tool_name, kwargs)
+        
         # 其他工具需要在主线程执行（Houdini hou 模块操作）
         return self._execute_tool_in_main_thread(tool_name, kwargs)
+    
+    def _execute_tool_in_bg(self, tool_name: str, kwargs: dict) -> dict:
+        """在后台线程直接执行工具（不阻塞 UI 主线程）
+        
+        仅用于不依赖 hou 模块的工具，如 execute_shell、search_local_doc 等。
+        """
+        try:
+            return self.mcp.execute_tool(tool_name, kwargs)
+        except Exception as e:
+            import traceback
+            return {"success": False, "error": f"后台执行异常: {e}\n{traceback.format_exc()[:300]}"}
     
     def _execute_tool_in_main_thread(self, tool_name: str, kwargs: dict) -> dict:
         """在主线程执行工具（线程安全）
