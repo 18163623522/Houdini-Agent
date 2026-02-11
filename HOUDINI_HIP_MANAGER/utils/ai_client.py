@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 AI 调用客户端（Houdini 工具专用）
-支持 OpenAI / DeepSeek / 智谱GLM（GLM-4, GLM-Z1推理, GLM-4V视觉）
+支持 OpenAI / DeepSeek / 智谱GLM（GLM-4.7）
 支持 Function Calling、流式传输、联网搜索
 
 安全提示：不要将密钥提交到版本库。
@@ -1052,7 +1052,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "verify_and_summarize",
-            "description": "【任务结束前必调用】验证节点网络并生成总结。自动检测:1.孤立节点 2.错误节点 3.连接完整性 4.显示标志。如果发现问题必须修复后重新调用，直到通过。在此之前应先用 get_network_structure 自行检查网络是否完整。",
+            "description": "【任务结束前必调用】验证节点网络并生成总结。自动检测:1.孤立节点 2.错误节点 3.连接完整性 4.显示标志。已内置 get_network_structure，不需要在调用前单独查询网络。如果发现问题必须修复后重新调用，直到通过。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1618,12 +1618,12 @@ class AIClient:
 
     def _get_default_model(self, provider: str) -> str:
         defaults = {
-            'openai': 'gpt-4o-mini', 
+            'openai': 'gpt-5.2', 
             'deepseek': 'deepseek-chat', 
             'glm': 'glm-4.7',
             'ollama': 'qwen2.5:14b'
         }
-        return defaults.get(provider, 'gpt-4o-mini')
+        return defaults.get(provider, 'gpt-5.2')
 
     # ============================================================
     # 模型特性判断
@@ -1634,12 +1634,11 @@ class AIClient:
         """判断模型是否为原生推理模型（API 返回 reasoning_content 字段）
         
         仅限明确通过 reasoning_content 字段返回推理的模型：
-        DeepSeek-R1/Reasoner, GLM-Z1 系列, GLM-4.7, 以及 -think 后缀的模型
+        DeepSeek-R1/Reasoner, GLM-4.7, 以及 -think 后缀的模型
         """
         m = model.lower()
         return (
             'reasoner' in m or 'r1' in m
-            or m.startswith('glm-z1')
             or m == 'glm-4.7'
             or m.endswith('-think')  # Duojie/Factory think 变体
         )
@@ -1669,7 +1668,7 @@ class AIClient:
     
     @staticmethod
     def _parse_usage(usage: dict) -> dict:
-        """解析 API 返回的 usage 数据为统一格式"""
+        """解析 API 返回的 usage 数据为统一格式（含 reasoning tokens）"""
         if not usage:
             return {}
         prompt_tokens = usage.get('prompt_tokens', 0)
@@ -1677,9 +1676,23 @@ class AIClient:
         cache_miss = usage.get('prompt_cache_miss_tokens', 0)
         completion = usage.get('completion_tokens', 0)
         total = usage.get('total_tokens', 0) or (prompt_tokens + completion)
+        
+        # 提取 reasoning / thinking tokens（Cursor 风格）
+        # OpenAI: completion_tokens_details.reasoning_tokens
+        # DeepSeek: completion_tokens_details.reasoning_tokens
+        # Anthropic: 可能在 output_tokens_details.thinking 中
+        reasoning_tokens = 0
+        details = usage.get('completion_tokens_details') or {}
+        if isinstance(details, dict):
+            reasoning_tokens = details.get('reasoning_tokens', 0) or 0
+        # 某些 API 直接返回 reasoning_tokens 顶级字段
+        if not reasoning_tokens:
+            reasoning_tokens = usage.get('reasoning_tokens', 0) or 0
+        
         return {
             'prompt_tokens': prompt_tokens,
             'completion_tokens': completion,
+            'reasoning_tokens': reasoning_tokens,
             'total_tokens': total,
             'cache_hit_tokens': cache_hit,
             'cache_miss_tokens': cache_miss,
@@ -1692,7 +1705,7 @@ class AIClient:
     
     def chat_stream(self,
                     messages: List[Dict[str, str]],
-                    model: str = 'gpt-4o-mini',
+                    model: str = 'gpt-5.2',
                     provider: str = 'openai',
                     temperature: float = 0.3,
                     max_tokens: Optional[int] = None,
@@ -1968,7 +1981,7 @@ class AIClient:
     
     def chat(self,
              messages: List[Dict[str, str]],
-             model: str = 'gpt-4o-mini',
+             model: str = 'gpt-5.2',
              provider: str = 'openai',
              temperature: float = 0.3,
              max_tokens: Optional[int] = None,
@@ -2050,7 +2063,7 @@ class AIClient:
     
     def agent_loop_stream(self,
                           messages: List[Dict[str, Any]],
-                          model: str = 'gpt-4o-mini',
+                          model: str = 'gpt-5.2',
                           provider: str = 'openai',
                           max_iterations: int = 999,
                           temperature: float = 0.3,
@@ -2079,6 +2092,7 @@ class AIClient:
         working_messages = list(messages)
         initial_msg_count = len(working_messages)  # 跟踪初始消息数量，用于提取新消息链
         tool_calls_history = []
+        call_records = []  # 每次 API 调用的详细记录（对齐 Cursor）
         full_content = ""
         iteration = 0
         
@@ -2086,6 +2100,7 @@ class AIClient:
         total_usage = {
             'prompt_tokens': 0,
             'completion_tokens': 0,
+            'reasoning_tokens': 0,
             'total_tokens': 0,
             'cache_hit_tokens': 0,
             'cache_miss_tokens': 0,
@@ -2100,6 +2115,11 @@ class AIClient:
         server_error_retries = 0    # 连续服务端错误重试计数
         max_server_retries = 3      # 最多重试 3 次服务端错误
         
+        # ★ Cursor 风格：同轮去重缓存
+        # 如果 AI 在同一 turn 中用相同参数调用相同工具，直接返回缓存结果
+        # key: "tool_name:sorted_args_json" → value: result dict
+        _turn_dedup_cache: Dict[str, dict] = {}
+        
         while iteration < max_iterations:
             # 检查停止请求
             if self._stop_event.is_set():
@@ -2110,12 +2130,14 @@ class AIClient:
                     'final_content': '',
                     'new_messages': working_messages[initial_msg_count:],
                     'tool_calls_history': tool_calls_history,
+                    'call_records': call_records,
                     'iterations': iteration,
                     'stopped': True,
                     'usage': total_usage
                 }
             
             iteration += 1
+            _call_start = time.time()  # 记录本次 API 调用起始时间（对齐 Cursor 延迟统计）
             
             # 收集本轮的内容和工具调用
             round_content = ""
@@ -2128,19 +2150,11 @@ class AIClient:
             # 发送前清洗消息（修复 tool_call_id 缺失等问题）
             working_messages = self._sanitize_working_messages(working_messages)
             
-            # ⚠️ Cursor 风格：不主动压缩 assistant 消息
-            # 只对超长的 tool 结果做温和压缩（它们在 _progressive_trim 中也会被处理）
-            # assistant 消息永不截断——保留完整上下文是 Cursor 的核心设计
-            if iteration > 1 and len(working_messages) > 30:
-                protect_start = max(1, len(working_messages) - 10)
-                for i, m in enumerate(working_messages):
-                    if i == 0 or i >= protect_start:
-                        continue
-                    role = m.get('role', '')
-                    c = m.get('content') or ''
-                    # 只压缩 tool 结果（超过 2000 字符的），assistant 和 user 永不压缩
-                    if role == 'tool' and len(c) > 2000:
-                        m['content'] = self._summarize_tool_content(c, 1500)
+            # ⚠️ Cursor 风格：同一轮 agent turn 内，所有消息完整保留
+            # - assistant 消息永不截断
+            # - tool 结果也完整保留（AI 需要完整的查询结果来做决策）
+            # - 只有在 context_length_exceeded 错误时才由 _progressive_trim 处理
+            # 不做任何同轮内压缩——这是 Cursor 的核心设计
             
             # 诊断：打印第二次及之后请求的消息结构
             if iteration > 1:
@@ -2180,6 +2194,7 @@ class AIClient:
                         'final_content': round_content,
                         'new_messages': working_messages[initial_msg_count:],
                         'tool_calls_history': tool_calls_history,
+                        'call_records': call_records,
                         'iterations': iteration,
                         'stopped': True,
                         'usage': total_usage
@@ -2195,6 +2210,7 @@ class AIClient:
                         'final_content': round_content,
                         'new_messages': working_messages[initial_msg_count:],
                         'tool_calls_history': tool_calls_history,
+                        'call_records': call_records,
                         'iterations': iteration,
                         'stopped': True,
                         'usage': total_usage
@@ -2325,9 +2341,38 @@ class AIClient:
                     if usage:
                         total_usage['prompt_tokens'] += usage.get('prompt_tokens', 0)
                         total_usage['completion_tokens'] += usage.get('completion_tokens', 0)
+                        total_usage['reasoning_tokens'] += usage.get('reasoning_tokens', 0)
                         total_usage['total_tokens'] += usage.get('total_tokens', 0)
                         total_usage['cache_hit_tokens'] += usage.get('cache_hit_tokens', 0)
                         total_usage['cache_miss_tokens'] += usage.get('cache_miss_tokens', 0)
+                    
+                    # ---- 记录本次 API 调用详情（对齐 Cursor） ----
+                    import datetime as _dt
+                    _call_latency = time.time() - _call_start
+                    _rec_inp = usage.get('prompt_tokens', 0)
+                    _rec_out = usage.get('completion_tokens', 0)
+                    _rec_reason = usage.get('reasoning_tokens', 0)
+                    _rec_chit = usage.get('cache_hit_tokens', 0)
+                    _rec_cmiss = usage.get('cache_miss_tokens', 0)
+                    try:
+                        from HOUDINI_HIP_MANAGER.utils.token_optimizer import calculate_cost as _calc_cost
+                        _rec_cost = _calc_cost(model, _rec_inp, _rec_out, _rec_chit, _rec_cmiss, _rec_reason)
+                    except Exception:
+                        _rec_cost = 0.0
+                    call_records.append({
+                        'timestamp': _dt.datetime.now().isoformat(),
+                        'model': model,
+                        'iteration': iteration,
+                        'input_tokens': _rec_inp,
+                        'output_tokens': _rec_out,
+                        'reasoning_tokens': _rec_reason,
+                        'cache_hit': _rec_chit,
+                        'cache_miss': _rec_cmiss,
+                        'total_tokens': usage.get('total_tokens', 0),
+                        'latency': round(_call_latency, 2),
+                        'has_tool_calls': len(round_tool_calls) > 0,
+                        'estimated_cost': _rec_cost,
+                    })
                     break
             
             # 错误恢复：跳过本轮剩余逻辑，重新请求 API
@@ -2344,6 +2389,7 @@ class AIClient:
                     'final_content': '',
                     'new_messages': working_messages[initial_msg_count:],
                     'tool_calls_history': tool_calls_history,
+                    'call_records': call_records,
                     'iterations': iteration,
                     'usage': total_usage
                 }
@@ -2363,6 +2409,7 @@ class AIClient:
                     'final_content': round_content,  # 最后一轮的回复（不含中间轮次）
                     'new_messages': working_messages[initial_msg_count:],  # 原生工具交互链
                     'tool_calls_history': tool_calls_history,
+                    'call_records': call_records,
                     'iterations': iteration,
                     'usage': total_usage
                 }
@@ -2392,6 +2439,15 @@ class AIClient:
                     arguments = {}
                 parsed_calls.append((tool_id, tool_name, arguments, tool_call))
 
+            # ★ 同轮去重：纯查询类工具用相同参数重复调用时直接返回缓存
+            # 只对无副作用的查询工具去重（execute_python/run_skill/web_search 等有副作用的不去重）
+            _DEDUP_TOOLS = frozenset({
+                'get_network_structure', 'get_node_parameters', 'list_children',
+                'read_selection', 'search_node_types', 'semantic_search_nodes',
+                'find_nodes_by_param', 'check_errors', 'search_local_doc',
+                'get_houdini_node_doc', 'get_node_inputs', 'list_skills',
+            })
+            
             # 分离可并行工具（web + shell）和 Houdini 工具（需主线程串行）
             _ASYNC_TOOL_NAMES = frozenset({'web_search', 'fetch_webpage', 'execute_shell'})
             async_calls = [(i, pc) for i, pc in enumerate(parsed_calls) if pc[1] in _ASYNC_TOOL_NAMES]
@@ -2399,9 +2455,25 @@ class AIClient:
 
             # 结果槽位：保持原始顺序
             results_ordered = [None] * len(parsed_calls)
+            dedup_flags = [False] * len(parsed_calls)  # 标记哪些是缓存命中
 
-            # --- 并行执行 async 工具（web + shell） ---
-            if len(async_calls) > 1:
+            # --- 先检查去重缓存 ---
+            for idx, (tid, tname, targs, _tc) in enumerate(parsed_calls):
+                dedup_key = f"{tname}:{json.dumps(targs, sort_keys=True)}"
+                if tname in _DEDUP_TOOLS and dedup_key in _turn_dedup_cache:
+                    # ★ 缓存命中：直接返回之前的结果
+                    results_ordered[idx] = _turn_dedup_cache[dedup_key]
+                    dedup_flags[idx] = True
+                    print(f"[AI Client] ♻️ 同轮去重命中: {tname}({json.dumps(targs, ensure_ascii=False)[:80]})")
+
+            # 分离未缓存的调用
+            uncached_async = [(i, pc) for i, pc in enumerate(parsed_calls) 
+                             if pc[1] in _ASYNC_TOOL_NAMES and not dedup_flags[i]]
+            uncached_houdini = [(i, pc) for i, pc in enumerate(parsed_calls) 
+                               if pc[1] not in _ASYNC_TOOL_NAMES and not dedup_flags[i]]
+
+            # --- 并行执行未缓存的 async 工具（web + shell） ---
+            if len(uncached_async) > 1:
                 import concurrent.futures
                 def _exec_async(idx_pc):
                     idx, (tid, tname, targs, _tc) = idx_pc
@@ -2411,11 +2483,11 @@ class AIClient:
                         return idx, self._execute_fetch_webpage(targs)
                     else:  # execute_shell
                         return idx, self._tool_executor(tname, **targs)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(async_calls))) as pool:
-                    for idx, result in pool.map(_exec_async, async_calls):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(uncached_async))) as pool:
+                    for idx, result in pool.map(_exec_async, uncached_async):
                         results_ordered[idx] = result
-            elif len(async_calls) == 1:
-                idx, (tid, tname, targs, _tc) = async_calls[0]
+            elif len(uncached_async) == 1:
+                idx, (tid, tname, targs, _tc) = uncached_async[0]
                 if tname == 'web_search':
                     results_ordered[idx] = self._execute_web_search(targs)
                 elif tname == 'fetch_webpage':
@@ -2423,11 +2495,36 @@ class AIClient:
                 else:  # execute_shell
                     results_ordered[idx] = self._tool_executor(tname, **targs)
 
-            # --- 串行执行 Houdini 工具（需主线程） ---
-            for idx, (tid, tname, targs, _tc) in houdini_calls:
+            # --- 串行执行未缓存的 Houdini 工具（需主线程） ---
+            for idx, (tid, tname, targs, _tc) in uncached_houdini:
                 results_ordered[idx] = self._tool_executor(tname, **targs)
                 # Houdini 工具间延迟，防止 API 过快
                 time.sleep(0.05)
+            
+            # --- 缓存维护 ---
+            # 如果本轮有操作类工具（创建/删除/连接节点等），清除网络结构相关缓存
+            # 因为操作改变了网络状态，之前缓存的查询结果可能已过期
+            _NETWORK_MUTATING_TOOLS = frozenset({
+                'create_node', 'create_nodes_batch', 'delete_node', 'connect_nodes',
+                'create_wrangle_node', 'copy_node', 'set_display_flag', 'undo_redo',
+            })
+            has_mutation = any(
+                pc[1] in _NETWORK_MUTATING_TOOLS 
+                for idx_m, pc in enumerate(parsed_calls) 
+                if not dedup_flags[idx_m]
+            )
+            if has_mutation:
+                # 清除 get_network_structure / list_children / check_errors 的缓存
+                keys_to_remove = [k for k in _turn_dedup_cache 
+                                  if k.startswith(('get_network_structure:', 'list_children:', 'check_errors:'))]
+                for k in keys_to_remove:
+                    del _turn_dedup_cache[k]
+            
+            # 将新执行的查询工具结果写入去重缓存
+            for idx, (tid, tname, targs, _tc) in enumerate(parsed_calls):
+                if not dedup_flags[idx] and tname in _DEDUP_TOOLS and results_ordered[idx]:
+                    dedup_key = f"{tname}:{json.dumps(targs, sort_keys=True)}"
+                    _turn_dedup_cache[dedup_key] = results_ordered[idx]
 
             # --- 统一处理结果（保持原始顺序） ---
             should_break_tool_limit = False
@@ -2463,6 +2560,10 @@ class AIClient:
                     on_tool_result(tool_name, arguments, result)
 
                 result_content = self._compress_tool_result(tool_name, result)
+                
+                # ★ 去重命中时追加提示，引导 AI 不要再重复调用
+                if dedup_flags[i]:
+                    result_content = f"[缓存] 本轮已用相同参数调用过此工具，以下是之前的结果（无需再次调用）:\n{result_content}"
 
                 working_messages.append({
                     'role': 'tool',
@@ -2477,6 +2578,7 @@ class AIClient:
                     'final_content': f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
                     'new_messages': working_messages[initial_msg_count:],
                     'tool_calls_history': tool_calls_history,
+                    'call_records': call_records,
                     'iterations': iteration,
                     'usage': total_usage
                 }
@@ -2549,6 +2651,7 @@ class AIClient:
             'final_content': '',  # max iterations 时无明确的最终回复
             'new_messages': working_messages[initial_msg_count:],
             'tool_calls_history': tool_calls_history,
+            'call_records': call_records,
             'iterations': iteration,
             'usage': total_usage
         }
@@ -2656,6 +2759,10 @@ class AIClient:
 -直接给出执行结果(1句以内)
 -不输出任何思考内容
 
+节点路径输出规范:
+-回复中提及节点时必须写完整绝对路径(如/obj/geo1/box1),不能只写节点名(如box1)
+-路径会自动变为可点击链接,用户可直接跳转到对应节点
+
 工具调用参数规范（最高优先级）:
 -调用前必须确认所有(必填)参数都已填写,缺少必填参数会导致调用失败
 -node_path必须用完整绝对路径(如"/obj/geo1/box1"),不能只写节点名
@@ -2664,18 +2771,15 @@ class AIClient:
 -每次调用都要完整填写所有必填参数,不要假设系统记住上次参数
 
 安全操作规则（必须遵守）:
--操作节点前先用get_network_structure确认节点存在
--设置参数前必须先用get_node_parameters查询正确的参数名和类型,不要猜测参数名(该工具同时返回节点状态、连接、错误等概况信息)
+-首次了解网络时调用get_network_structure,已查询过的网络不要重复调用(系统缓存同轮查询结果)
+-设置参数前必须先用get_node_parameters查询正确的参数名和类型,不要猜测参数名
 -execute_python中必须检查None:node=hou.node(path);if node:...
 -创建节点后用返回的路径操作,不要猜测路径
 -连接节点前确认两个节点都已存在
 
 完成前必须检查（任务结束前强制执行）:
--调用get_network_structure检查节点网络
--确认所有节点已正确连接,无孤立节点
--检查是否有错误标记的节点,有则修复
--确认输出节点已设为显示
--只有检查通过才能结束任务
+-调用verify_and_summarize自动检测(已内置网络检查,不需先调get_network_structure)
+-如有问题修复后重新调用verify_and_summarize直到通过
 
 ## 工具调用格式
 
@@ -2787,6 +2891,7 @@ class AIClient:
             working_messages.insert(0, {'role': 'system', 'content': json_system_prompt})
         
         tool_calls_history = []
+        call_records = []  # 每次 API 调用的详细记录（对齐 Cursor）
         full_content = ""
         iteration = 0
         self._json_thinking_buffer = ""  # 初始化思考缓冲区
@@ -2795,6 +2900,7 @@ class AIClient:
         total_usage = {
             'prompt_tokens': 0,
             'completion_tokens': 0,
+            'reasoning_tokens': 0,
             'total_tokens': 0,
             'cache_hit_tokens': 0,
             'cache_miss_tokens': 0,
@@ -2813,10 +2919,12 @@ class AIClient:
                 return {
                     'ok': False, 'error': '用户停止了请求',
                     'content': full_content, 'tool_calls_history': tool_calls_history,
+                    'call_records': call_records,
                     'iterations': iteration, 'stopped': True, 'usage': total_usage
                 }
             
             iteration += 1
+            _call_start = time.time()  # 记录本次 API 调用起始时间（对齐 Cursor 延迟统计）
             round_content = ""
             
             # ⚠️ 主动防御：每轮迭代前压缩过长的消息内容
@@ -2849,6 +2957,7 @@ class AIClient:
                         'ok': False, 'error': '用户停止了请求',
                         'content': full_content + round_content,
                         'tool_calls_history': tool_calls_history,
+                        'call_records': call_records,
                         'iterations': iteration, 'stopped': True, 'usage': total_usage
                     }
                 
@@ -2888,6 +2997,7 @@ class AIClient:
                             return {
                                 'ok': False, 'error': f"连续出错: {err_msg}",
                                 'content': full_content, 'tool_calls_history': tool_calls_history,
+                                'call_records': call_records,
                                 'iterations': iteration, 'usage': total_usage
                             }
                         
@@ -2914,6 +3024,7 @@ class AIClient:
                     return {
                         'ok': False, 'error': err_msg,
                         'content': full_content, 'tool_calls_history': tool_calls_history,
+                        'call_records': call_records,
                         'iterations': iteration, 'usage': total_usage
                     }
                 
@@ -2925,9 +3036,38 @@ class AIClient:
                     if usage:
                         total_usage['prompt_tokens'] += usage.get('prompt_tokens', 0)
                         total_usage['completion_tokens'] += usage.get('completion_tokens', 0)
+                        total_usage['reasoning_tokens'] += usage.get('reasoning_tokens', 0)
                         total_usage['total_tokens'] += usage.get('total_tokens', 0)
                         total_usage['cache_hit_tokens'] += usage.get('cache_hit_tokens', 0)
                         total_usage['cache_miss_tokens'] += usage.get('cache_miss_tokens', 0)
+                    
+                    # ---- 记录本次 API 调用详情（对齐 Cursor） ----
+                    import datetime as _dt
+                    _call_latency = time.time() - _call_start
+                    _rec_inp = usage.get('prompt_tokens', 0)
+                    _rec_out = usage.get('completion_tokens', 0)
+                    _rec_reason = usage.get('reasoning_tokens', 0)
+                    _rec_chit = usage.get('cache_hit_tokens', 0)
+                    _rec_cmiss = usage.get('cache_miss_tokens', 0)
+                    try:
+                        from HOUDINI_HIP_MANAGER.utils.token_optimizer import calculate_cost as _calc_cost
+                        _rec_cost = _calc_cost(model, _rec_inp, _rec_out, _rec_chit, _rec_cmiss, _rec_reason)
+                    except Exception:
+                        _rec_cost = 0.0
+                    call_records.append({
+                        'timestamp': _dt.datetime.now().isoformat(),
+                        'model': model,
+                        'iteration': iteration,
+                        'input_tokens': _rec_inp,
+                        'output_tokens': _rec_out,
+                        'reasoning_tokens': _rec_reason,
+                        'cache_hit': _rec_chit,
+                        'cache_miss': _rec_cmiss,
+                        'total_tokens': usage.get('total_tokens', 0),
+                        'latency': round(_call_latency, 2),
+                        'has_tool_calls': False,
+                        'estimated_cost': _rec_cost,
+                    })
                     break
             
             # 清理内容中的XML标签和格式问题（更彻底的清理）
@@ -2966,6 +3106,7 @@ class AIClient:
                     'ok': True,
                     'content': full_content,
                     'tool_calls_history': tool_calls_history,
+                    'call_records': call_records,
                     'iterations': iteration,
                     'usage': total_usage
                 }
@@ -3176,13 +3317,14 @@ class AIClient:
             'ok': True,
             'content': full_content if full_content.strip() else "(工具调用完成，但未生成回复)",
             'tool_calls_history': tool_calls_history,
+            'call_records': call_records,
             'iterations': iteration,
             'usage': total_usage
         }
     
     def agent_loop_auto(self,
                         messages: List[Dict[str, Any]],
-                        model: str = 'gpt-4o-mini',
+                        model: str = 'gpt-5.2',
                         provider: str = 'openai',
                         **kwargs) -> Dict[str, Any]:
         """自动选择合适的 Agent Loop 模式"""

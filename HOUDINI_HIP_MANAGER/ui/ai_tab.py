@@ -3,7 +3,7 @@
 Houdini AI 助手 - Cursor 风格极简 UI
 支持执行计划、多轮工具调用、流式传输
 
-提供商：DeepSeek / 智谱GLM(GLM-4, GLM-Z1, GLM-4V) / OpenAI
+提供商：DeepSeek / 智谱GLM(GLM-4.7) / OpenAI
 """
 
 import json
@@ -122,15 +122,18 @@ class AITab(QtWidgets.QWidget):
         self._tag_parse_buf = ""
         self._thinking_needs_finalize = False  # 标记是否需要 finalize 思考区块
         
-        # Token 使用统计（累积值，每轮对话叠加）
+        # Token 使用统计（累积值，每轮对话叠加）—— 对齐 Cursor
         self._token_stats = {
             'input_tokens': 0,      # 输入 token 总数
             'output_tokens': 0,     # 输出 token 总数
+            'reasoning_tokens': 0,  # 推理 token（输出的子集）
             'cache_read': 0,        # Cache 读取（命中）token
             'cache_write': 0,       # Cache 写入（未命中）token
             'total_tokens': 0,      # 总 token 数
             'requests': 0,          # 请求次数
+            'estimated_cost': 0.0,  # 预估费用（USD）
         }
+        self._call_records: list = []  # 每次 API 调用的详细记录（对齐 Cursor）
         
         # 工具执行线程安全机制（使用队列和锁避免竞争）
         self._tool_result_queue: queue.Queue = queue.Queue()
@@ -217,6 +220,14 @@ copytopoints 第0输入=模板几何体，第1输入=目标点。需要一个小
 """
 
         base_prompt += """
+节点路径输出规范（回复中提及节点时必须遵守）:
+-在回复文本中提及任何 Houdini 节点时，**必须**使用完整绝对路径，如 /obj/geo1/box1，而不是只写节点名 box1
+-路径格式必须以根类别开头: /obj/..., /out/..., /ch/..., /shop/..., /stage/..., /mat/..., /tasks/...
+-正确示例: "已创建节点 /obj/geo1/scatter1 并连接到 /obj/geo1/box1"
+-错误示例: "已创建节点 scatter1 并连接到 box1"（缺少完整路径，用户无法点击跳转）
+-列举多个节点时，每个都要写完整路径: "/obj/geo1/box1, /obj/geo1/transform1, /obj/geo1/merge1"
+-节点路径会自动变为可点击链接，用户点击后可直接跳转到对应节点，所以路径的准确性至关重要
+
 禁止伪造工具调用（最高优先级规则，违反等同失败）:
 -你**绝对不能**在回复文本中编写看起来像工具执行结果的内容
 -**绝对不能**在回复中出现"[ok] web_search:"、"[ok] fetch_webpage:"、"[工具执行结果]"等文本
@@ -233,12 +244,13 @@ copytopoints 第0输入=模板几何体，第1输入=目标点。需要一个小
 -多次调用同一工具时，每次都要完整填写所有必填参数，不要假设系统会记住上次的参数
 
 安全操作规则:
--操作节点前先用 get_network_structure 或 list_children 确认节点存在
+-首次需要了解网络时调用 get_network_structure 或 list_children，**但不要对已查询过的网络重复调用**（系统会自动缓存同轮内的查询结果）
 -设置参数前**必须**先调用 get_node_parameters 查看该节点有哪些参数、参数名是什么、当前值和默认值，绝对不能凭记忆或猜测参数名
 -如果需要修改多个参数，先一次性用 get_node_parameters 查完，再逐个 set_node_parameter
 -execute_python 中必须检查 None: node=hou.node(path); if node: ...
 -创建节点后用返回路径操作，不要猜测路径
 -连接节点前确认两端节点都已存在
+-**禁止重复查询**：同一 network_path 只需查一次，结果在本轮内保持有效。如果你已经查看过某个网络的结构，直接使用之前的结果即可
 
 创建节点失败时的恢复流程（必须严格执行）:
 -如果 create_node 返回错误（如"未识别的节点类型"），**禁止**直接重试或放弃
@@ -253,15 +265,10 @@ copytopoints 第0输入=模板几何体，第1输入=目标点。需要一个小
 -如果需要修改现有 wrangle 节点的代码，先用 get_node_parameters 读取完整的 snippet 参数，再用 set_node_parameter 设置新代码
 
 任务完成前的强制验证（必须执行，不能跳过）:
-1. 调用 get_network_structure 获取当前网络，逐一核对：
-   -你计划创建的每个节点是否都已存在
-   -节点之间的连接是否符合预期的数据流
-   -是否有遗漏的节点或连接
-   -如果有 wrangle 节点，检查其 VEX 代码是否正确实现了预期逻辑
-2. 调用 check_errors 检查Houdini节点是否有cooking错误（注意：check_errors只用于检查节点cooking错误，工具调用失败的错误信息已在返回结果中直接给出，无需调用check_errors）
-3. 如果发现缺少节点、连接断裂或存在错误，**必须修复后再次验证**，直到网络完全正确
-4. 最后调用 verify_and_summarize，传入你期望的节点列表和预期效果
-5. 确认输出节点已设为显示
+1. 调用 verify_and_summarize 进行自动检测（孤立节点、错误节点、连接完整性、显示标志），传入你期望的节点列表和预期效果
+2. 如果 verify_and_summarize 报告问题，修复后再次调用，直到通过
+3. 注意：不需要在 verify_and_summarize 之前单独调用 get_network_structure —— verify_and_summarize 已内置网络检查
+4. check_errors 只用于检查节点 cooking 错误，工具调用失败的错误信息已在返回结果中直接给出，无需调用 check_errors
 
 工具优先级: create_wrangle_node(VEX优先) > create_nodes_batch > create_node
 节点输入: 0=主输入, 1=第二输入 | from_path=上游, to_path=下游
@@ -404,13 +411,8 @@ Todo 管理规则（严格遵守）:
         self._model_map = {
             'ollama': ['qwen2.5:14b', 'qwen2.5:7b', 'llama3:8b', 'mistral:7b'],
             'deepseek': ['deepseek-chat', 'deepseek-reasoner'],
-            'glm': [
-                'glm-4.7',
-                'glm-4-plus', 'glm-4-airx', 'glm-4-air', 'glm-4-flash', 'glm-4-long', 'glm-4-flashx-250414',
-                'glm-z1-flash', 'glm-z1-air', 'glm-z1-airx',
-                'glm-4v-flash', 'glm-4v-plus-0111',
-            ],
-            'openai': ['gpt-4o-mini', 'gpt-4o'],
+            'glm': ['glm-4.7'],
+            'openai': ['gpt-5.2'],
             'duojie': [
                 'claude-sonnet-4-5',
                 'claude-opus-4-5-kiro',
@@ -423,11 +425,7 @@ Todo 管理规则（严格遵守）:
             'qwen2.5:14b': 32000, 'qwen2.5:7b': 32000, 'llama3:8b': 8000, 'mistral:7b': 32000,
             'deepseek-chat': 64000, 'deepseek-reasoner': 64000,
             'glm-4.7': 200000,
-            'glm-4-plus': 128000, 'glm-4-air': 128000, 'glm-4-airx': 128000,
-            'glm-4-flash': 128000, 'glm-4-flashx-250414': 128000, 'glm-4-long': 1000000,
-            'glm-z1-air': 32000, 'glm-z1-airx': 32000, 'glm-z1-flash': 32000,
-            'glm-4v-flash': 8000, 'glm-4v-plus-0111': 8000,
-            'gpt-4o-mini': 128000, 'gpt-4o': 128000,
+            'gpt-5.2': 128000,
             # Duojie 模型
             'claude-sonnet-4-5': 200000,
             'claude-opus-4-5-kiro': 200000,
@@ -1142,93 +1140,65 @@ Todo 管理规则（严格遵守）:
             self.btn_optimize.setStyleSheet(self._small_btn_style())
 
     def _update_token_stats_display(self):
-        """更新 Token 统计按钮显示"""
+        """更新 Token 统计按钮显示（对齐 Cursor：显示费用）"""
         total = self._token_stats['total_tokens']
+        cost = self._token_stats.get('estimated_cost', 0.0)
         
-        # 格式化显示
+        # 格式化 token 显示
         if total >= 1000000:
-            display = f"{total / 1000000:.1f}M"
+            tok_display = f"{total / 1000000:.1f}M"
         elif total >= 1000:
-            display = f"{total / 1000:.1f}K"
+            tok_display = f"{total / 1000:.1f}K"
         else:
-            display = str(total)
+            tok_display = str(total)
+        
+        # 格式化费用显示（Cursor 风格：$0.12）
+        if cost >= 1.0:
+            cost_display = f"${cost:.2f}"
+        elif cost >= 0.01:
+            cost_display = f"${cost:.2f}"
+        elif cost > 0:
+            cost_display = f"${cost:.4f}"
+        else:
+            cost_display = ""
+        
+        # 按钮文本：token数 | $费用
+        if cost_display:
+            self.token_stats_btn.setText(f"{tok_display} | {cost_display}")
+        else:
+            self.token_stats_btn.setText(tok_display)
         
         # 计算 cache 命中率
         cache_read = self._token_stats['cache_read']
         cache_write = self._token_stats['cache_write']
         cache_total = cache_read + cache_write
-        
-        if cache_total > 0:
-            hit_rate = (cache_read / cache_total) * 100
-            self.token_stats_btn.setText(f"{display} | {hit_rate:.0f}%")
-        else:
-            self.token_stats_btn.setText(display)
-        
-        # 更新 tooltip
         hit_rate_display = f"{(cache_read / cache_total * 100):.1f}%" if cache_total > 0 else "N/A"
+        
+        reasoning = self._token_stats.get('reasoning_tokens', 0)
+        reasoning_line = f"推理 Token: {reasoning:,}\n" if reasoning > 0 else ""
+        
         self.token_stats_btn.setToolTip(
             f"累计统计 ({self._token_stats['requests']} 次请求)\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"输入: {self._token_stats['input_tokens']:,}\n"
             f"输出: {self._token_stats['output_tokens']:,}\n"
+            f"{reasoning_line}"
             f"Cache 读取: {cache_read:,}\n"
             f"Cache 写入: {cache_write:,}\n"
             f"Cache 命中率: {hit_rate_display}\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"总计: {total:,}\n"
+            f"预估费用: {cost_display or '$0.00'}\n"
             f"点击查看详情"
         )
     
     def _show_token_stats_dialog(self):
-        """显示详细 Token 统计对话框"""
-        stats = self._token_stats
-        
-        cache_read = stats['cache_read']
-        cache_write = stats['cache_write']
-        cache_total = cache_read + cache_write
-        hit_rate = (cache_read / cache_total * 100) if cache_total > 0 else 0
-        
-        # 估算费用（以 DeepSeek 为例）
-        # 输入: $0.27/M tokens (cache miss), $0.07/M tokens (cache hit)
-        # 输出: $1.10/M tokens
-        input_cost = (cache_write * 0.27 + cache_read * 0.07) / 1000000
-        output_cost = stats['output_tokens'] * 1.10 / 1000000
-        total_cost = input_cost + output_cost
-        
-        msg = f"""
-<h3>Token 使用统计</h3>
-
-<table style="font-family: Consolas, monospace; font-size: 13px;">
-<tr><td style="padding: 4px 12px 4px 0;">输入 Token:</td><td style="text-align: right;">{stats['input_tokens']:,}</td></tr>
-<tr><td style="padding: 4px 12px 4px 0;">输出 Token:</td><td style="text-align: right;">{stats['output_tokens']:,}</td></tr>
-<tr><td colspan="2" style="padding: 8px 0;"><hr></td></tr>
-<tr><td style="padding: 4px 12px 4px 0;">Cache 读取 (命中):</td><td style="text-align: right; color: #4CAF50;">{cache_read:,}</td></tr>
-<tr><td style="padding: 4px 12px 4px 0;">Cache 写入 (未命中):</td><td style="text-align: right; color: #FF9800;">{cache_write:,}</td></tr>
-<tr><td style="padding: 4px 12px 4px 0;">Cache 命中率:</td><td style="text-align: right; font-weight: bold;">{hit_rate:.1f}%</td></tr>
-<tr><td colspan="2" style="padding: 8px 0;"><hr></td></tr>
-<tr><td style="padding: 4px 12px 4px 0;">总计 Token:</td><td style="text-align: right; font-weight: bold;">{stats['total_tokens']:,}</td></tr>
-<tr><td style="padding: 4px 12px 4px 0;">请求次数:</td><td style="text-align: right;">{stats['requests']}</td></tr>
-<tr><td colspan="2" style="padding: 8px 0;"><hr></td></tr>
-<tr><td style="padding: 4px 12px 4px 0;">预估费用 (DeepSeek):</td><td style="text-align: right; color: #2196F3;">${total_cost:.4f}</td></tr>
-</table>
-
-<p style="color: #888; font-size: 11px; margin-top: 12px;">
-* 费用估算基于 DeepSeek 定价：输入 $0.27/M (miss) $0.07/M (hit)，输出 $1.10/M
-</p>
-"""
-        
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setWindowTitle("Token 使用统计")
-        dialog.setTextFormat(QtCore.Qt.RichText)
-        dialog.setText(msg)
-        
-        # 添加重置按钮
-        reset_btn = dialog.addButton("重置统计", QtWidgets.QMessageBox.ActionRole)
-        dialog.addButton(QtWidgets.QMessageBox.Ok)
-        
+        """显示详细 Token 统计对话框（对齐 Cursor：使用 TokenAnalyticsPanel）"""
+        from HOUDINI_HIP_MANAGER.ui.cursor_widgets import TokenAnalyticsPanel
+        records = getattr(self, '_call_records', []) or []
+        dialog = TokenAnalyticsPanel(records, self._token_stats, parent=self)
         dialog.exec_()
-        
-        if dialog.clickedButton() == reset_btn:
+        if dialog.should_reset_stats:
             self._reset_token_stats()
     
     def _reset_token_stats(self):
@@ -1236,11 +1206,14 @@ Todo 管理规则（严格遵守）:
         self._token_stats = {
             'input_tokens': 0,
             'output_tokens': 0,
+            'reasoning_tokens': 0,
             'cache_read': 0,
             'cache_write': 0,
             'total_tokens': 0,
             'requests': 0,
+            'estimated_cost': 0.0,
         }
+        self._call_records = []
         self._update_token_stats_display()
         
         # 显示提示
@@ -1304,6 +1277,7 @@ Todo 管理规则（严格遵守）:
         """添加 AI 回复块"""
         response = AIResponse(self.chat_container)
         response.createWrangleRequested.connect(self._on_create_wrangle)
+        response.nodePathClicked.connect(self._navigate_to_node)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, response)
         self._current_response = response
         self._scroll_to_bottom(force=True)
@@ -1450,8 +1424,11 @@ Todo 管理规则（严格遵守）:
         # 过滤纯空白（只含换行/空格的 chunk）
         if not text.strip():
             return
-        resp.append_content(text)
-        self._scroll_agent_to_bottom(force=False)
+        try:
+            resp.append_content(text)
+            self._scroll_agent_to_bottom(force=False)
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
 
     def _on_content_with_limit(self, text: str):
         """处理内容追加，解析 <think> 标签，分离思考和正式内容"""
@@ -1541,10 +1518,13 @@ Todo 管理规则（严格遵守）:
     @QtCore.Slot()
     def _finalize_thinking_main_thread(self):
         """[主线程] 实际执行 finalize 思考区块并停止计时器"""
-        resp = self._agent_response or self._current_response
-        if resp and resp._has_thinking:
-            if not resp.thinking_section._finalized:
-                resp.thinking_section.finalize()
+        try:
+            resp = self._agent_response or self._current_response
+            if resp and resp._has_thinking:
+                if not resp.thinking_section._finalized:
+                    resp.thinking_section.finalize()
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
         if self._thinking_timer:
             self._thinking_timer.stop()
             self._thinking_timer = None
@@ -1552,11 +1532,14 @@ Todo 管理规则（严格遵守）:
     @QtCore.Slot()
     def _resume_thinking_main_thread(self):
         """[主线程] 实际执行恢复思考区块并重启计时器"""
-        resp = self._agent_response or self._current_response
-        if resp and resp._has_thinking:
-            ts = resp.thinking_section
-            if ts._finalized:
-                ts.resume()
+        try:
+            resp = self._agent_response or self._current_response
+            if resp and resp._has_thinking:
+                ts = resp.thinking_section
+                if ts._finalized:
+                    ts.resume()
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
         # 重启计时器（如果已停止）
         if not self._thinking_timer:
             self._thinking_timer = QtCore.QTimer(self)
@@ -1641,16 +1624,22 @@ Todo 管理规则（严格遵守）:
     @QtCore.Slot(str)
     def _on_add_thinking(self, text: str):
         """在主线程更新思考内容（槽函数）"""
-        resp = self._agent_response or self._current_response
-        if resp:
-            resp.add_thinking(text)
-        self._scroll_agent_to_bottom(force=False)
+        try:
+            resp = self._agent_response or self._current_response
+            if resp:
+                resp.add_thinking(text)
+            self._scroll_agent_to_bottom(force=False)
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
 
     def _on_add_status(self, text: str):
-        resp = self._agent_response or self._current_response
-        if resp:
-            resp.add_status(text)
-            self._scroll_agent_to_bottom(force=False)
+        try:
+            resp = self._agent_response or self._current_response
+            if resp:
+                resp.add_status(text)
+                self._scroll_agent_to_bottom(force=False)
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
 
     def _on_update_thinking(self):
         try:
@@ -1680,8 +1669,11 @@ Todo 管理规则（严格遵守）:
             self._on_append_content(self._output_buffer)
             self._output_buffer = ""
         
-        if resp:
-            resp.finalize()
+        try:
+            if resp:
+                resp.finalize()
+        except RuntimeError:
+            resp = None  # widget 已被 clear 销毁，跳过 UI 操作
         
         # ================================================================
         # Cursor 风格：保存原生消息链到对话历史
@@ -1763,17 +1755,39 @@ Todo 管理规则（严格遵守）:
         # 管理上下文
         self._manage_context()
         
-        # 更新 Token 统计（累积到 agent 所属 session 的 stats）
+        # 更新 Token 统计（累积到 agent 所属 session 的 stats）—— 对齐 Cursor
         usage = result.get('usage', {})
+        new_call_records = result.get('call_records', [])
         if usage:
             stats['input_tokens'] += usage.get('prompt_tokens', 0)
             stats['output_tokens'] += usage.get('completion_tokens', 0)
+            stats['reasoning_tokens'] = stats.get('reasoning_tokens', 0) + usage.get('reasoning_tokens', 0)
             stats['cache_read'] += usage.get('cache_hit_tokens', 0)
             stats['cache_write'] += usage.get('cache_miss_tokens', 0)
             stats['total_tokens'] += usage.get('total_tokens', 0)
             stats['requests'] += 1
             
-            # 如果当前显示的就是 agent session，更新 UI
+            # 计算本次费用并累积
+            from HOUDINI_HIP_MANAGER.utils.token_optimizer import calculate_cost
+            model_name = self.model_combo.currentText()
+            this_cost = calculate_cost(
+                model=model_name,
+                input_tokens=usage.get('prompt_tokens', 0),
+                output_tokens=usage.get('completion_tokens', 0),
+                cache_hit=usage.get('cache_hit_tokens', 0),
+                cache_miss=usage.get('cache_miss_tokens', 0),
+                reasoning_tokens=usage.get('reasoning_tokens', 0),
+            )
+            stats['estimated_cost'] = stats.get('estimated_cost', 0.0) + this_cost
+        
+        # 合并 call_records
+        if new_call_records:
+            if not hasattr(self, '_call_records'):
+                self._call_records = []
+            self._call_records.extend(new_call_records)
+        
+        # 如果当前显示的就是 agent session，更新 UI
+        if usage:
             if not self._agent_session_id or self._agent_session_id == self._session_id:
                 self._update_token_stats_display()
             
@@ -1811,9 +1825,12 @@ Todo 管理规则（严格遵守）:
             self._output_buffer = ""
         
         resp = self._agent_response or self._current_response
-        if resp:
-            resp.finalize()
-            resp.add_status(f"Error: {error}")
+        try:
+            if resp:
+                resp.finalize()
+                resp.add_status(f"Error: {error}")
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
         
         self._set_running(False)
 
@@ -1824,9 +1841,12 @@ Todo 管理规则（严格遵守）:
             self._output_buffer = ""
         
         resp = self._agent_response or self._current_response
-        if resp:
-            resp.finalize()
-            resp.add_status("Stopped")
+        try:
+            if resp:
+                resp.finalize()
+                resp.add_status("Stopped")
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
         
         self._set_running(False)
 
@@ -1836,13 +1856,16 @@ Todo 管理规则（严格遵守）:
         使用 agent 锚定的 todo_list / chat_layout，防止切换会话后
         写入错误的窗口。
         """
-        # 优先使用 agent 锚定的目标（会话 A 运行时不受会话 B 影响）
-        todo = self._agent_todo_list or self.todo_list
-        layout = self._agent_chat_layout or self.chat_layout
-        if not todo:
-            return
-        # 确保 todo_list 已在对应 chat_layout 中
-        self._ensure_todo_in_chat(todo, layout)
+        try:
+            # 优先使用 agent 锚定的目标（会话 A 运行时不受会话 B 影响）
+            todo = self._agent_todo_list or self.todo_list
+            layout = self._agent_chat_layout or self.chat_layout
+            if not todo:
+                return
+            # 确保 todo_list 已在对应 chat_layout 中
+            self._ensure_todo_in_chat(todo, layout)
+        except RuntimeError:
+            return  # widget 已被 clear 销毁
         if text:
             todo.add_todo(todo_id, text, status)
         else:
@@ -1853,6 +1876,12 @@ Todo 管理规则（严格遵守）:
         'execute_shell',       # subprocess.run，不依赖 hou
         'search_local_doc',    # 纯 Python 文本检索
         'list_skills',         # 纯 Python 列表
+    })
+
+    # 静默工具：不在执行列表 UI 中显示（AI 自行调用，用户无需感知）
+    _SILENT_TOOLS = frozenset({
+        'add_todo',
+        'update_todo',
     })
 
     def _execute_tool_with_todo(self, tool_name: str, **kwargs) -> dict:
@@ -2728,8 +2757,12 @@ Todo 管理规则（严格遵守）:
                     enable_thinking=use_think,
                     on_content=lambda c: self._on_content_with_limit(c),
                     on_thinking=lambda t: self._on_thinking_chunk(t),
-                    on_tool_call=lambda n, a: self._addStatus.emit(f"[tool]{n}"),
-                    on_tool_result=lambda n, a, r: self._add_tool_result(n, r, a)
+                    on_tool_call=lambda n, a: (
+                        self._addStatus.emit(f"[tool]{n}") if n not in self._SILENT_TOOLS else None
+                    ),
+                    on_tool_result=lambda n, a, r: (
+                        self._add_tool_result(n, r, a) if n not in self._SILENT_TOOLS else None
+                    )
                 )
             else:
                 # 非 Agent 模式也要限制输出 + 解析 <think> 标签
@@ -2809,7 +2842,7 @@ Todo 管理规则（严格遵守）:
                     'success': success,
                 }
                 self._addPythonShell.emit(code, json.dumps(shell_data))
-                # 同时关闭 ToolCallItem 进度条
+                # 同时设置 ToolCallItem 结果
                 short = f"[ok] Python ({len(code.splitlines())} lines)" if success else f"[err] {result_text[:50]}"
                 QtCore.QMetaObject.invokeMethod(
                     self, "_add_tool_result_ui",
@@ -2846,20 +2879,19 @@ Todo 管理规则（严格遵守）:
             if result.get('success'):
                 # 成功时使用节点操作标签
                 self._addNodeOperation.emit(name, json.dumps(result))
-                # 同时也要关闭对应 ToolCallItem 的进度条
-                short = result_text[:200] + "..." if len(result_text) > 200 else result_text
+                # 同时设置 ToolCallItem 结果（折叠式，可展开查看完整内容）
                 QtCore.QMetaObject.invokeMethod(
                     self, "_add_tool_result_ui",
                     QtCore.Qt.QueuedConnection,
                     QtCore.Q_ARG(str, name),
-                    QtCore.Q_ARG(str, f"[ok] {short}")
+                    QtCore.Q_ARG(str, f"[ok] {result_text}")
                 )
                 return
             else:
                 # 失败时显示错误信息（继续下面的逻辑）
                 pass
         
-        # 添加到执行流程（ToolCallItem 自身支持展开/收缩，不再需要额外折叠框）
+        # 添加到执行流程（CollapsibleSection 风格，点击展开查看完整结果）
         if self._agent_response or self._current_response:
             prefix = "[err]" if not success else "[ok]"
             QtCore.QMetaObject.invokeMethod(
@@ -2872,9 +2904,12 @@ Todo 管理规则（严格遵守）:
     @QtCore.Slot(str, str)
     def _add_tool_result_ui(self, name: str, result: str):
         """在 UI 线程中添加工具结果"""
-        resp = self._agent_response or self._current_response
-        if resp:
-            resp.add_tool_result(name, result)
+        try:
+            resp = self._agent_response or self._current_response
+            if resp:
+                resp.add_tool_result(name, result)
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
 
     @QtCore.Slot(str, str)
     def _add_collapsible_result(self, name: str, result: str):
@@ -2898,46 +2933,49 @@ Todo 管理规则（严格遵守）:
     @QtCore.Slot(str, str)
     def _on_add_node_operation(self, name: str, result_json: str):
         """处理节点操作高亮显示"""
-        resp = self._agent_response or self._current_response
-        if not resp:
-            return
-        
         try:
-            result = json.loads(result_json)
-        except Exception:
-            result = {}
-        
-        label = None
-        result_text = str(result.get('result', ''))
-        undo_snapshot = result.get('_undo_snapshot')  # 仅 delete_node 时会有
-        
-        # ---- 收集路径 & 操作类型 ----
-        op_type = 'create'
-        paths: list = []
-        
-        if name == 'create_node':
-            paths = self._extract_node_paths(result_text) or ([result_text] if result_text else [])
-            label = NodeOperationLabel('create', 1, paths) if paths else None
-        
-        elif name in ('create_nodes_batch', 'create_wrangle_node'):
-            paths = self._extract_node_paths(result_text) or ([result_text] if result_text else [])
-            label = NodeOperationLabel('create', len(paths) or 1, paths) if paths else None
-        
-        elif name == 'delete_node':
-            op_type = 'delete'
-            paths = self._extract_node_paths(result_text) or ([result_text] if result_text else [])
-            label = NodeOperationLabel('delete', len(paths) or 1, paths) if paths else None
-        
-        if label:
-            label.nodeClicked.connect(self._navigate_to_node)
-            # 用 lambda 捕获当前操作的上下文，使撤销精确到这一条操作
-            label.undoRequested.connect(
-                lambda _op=op_type, _paths=list(paths), _snap=undo_snapshot:
-                    self._undo_node_operation(_op, _paths, _snap)
-            )
-            resp.details_layout.addWidget(label)
-        
-        self._scroll_agent_to_bottom()
+            resp = self._agent_response or self._current_response
+            if not resp:
+                return
+            
+            try:
+                result = json.loads(result_json)
+            except Exception:
+                result = {}
+            
+            label = None
+            result_text = str(result.get('result', ''))
+            undo_snapshot = result.get('_undo_snapshot')  # 仅 delete_node 时会有
+            
+            # ---- 收集路径 & 操作类型 ----
+            op_type = 'create'
+            paths: list = []
+            
+            if name == 'create_node':
+                paths = self._extract_node_paths(result_text) or ([result_text] if result_text else [])
+                label = NodeOperationLabel('create', 1, paths) if paths else None
+            
+            elif name in ('create_nodes_batch', 'create_wrangle_node'):
+                paths = self._extract_node_paths(result_text) or ([result_text] if result_text else [])
+                label = NodeOperationLabel('create', len(paths) or 1, paths) if paths else None
+            
+            elif name == 'delete_node':
+                op_type = 'delete'
+                paths = self._extract_node_paths(result_text) or ([result_text] if result_text else [])
+                label = NodeOperationLabel('delete', len(paths) or 1, paths) if paths else None
+            
+            if label:
+                label.nodeClicked.connect(self._navigate_to_node)
+                # 用 lambda 捕获当前操作的上下文，使撤销精确到这一条操作
+                label.undoRequested.connect(
+                    lambda _op=op_type, _paths=list(paths), _snap=undo_snapshot:
+                        self._undo_node_operation(_op, _paths, _snap)
+                )
+                resp.details_layout.addWidget(label)
+            
+            self._scroll_agent_to_bottom()
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
     
     def _navigate_to_node(self, node_path: str):
         """点击节点标签时，跳转到该节点并选中"""
@@ -3081,103 +3119,107 @@ Todo 管理规则（严格遵守）:
     @QtCore.Slot(str, str)
     def _on_add_python_shell(self, code: str, result_json: str):
         """处理 execute_python 的专用 UI 展示"""
-        resp = self._agent_response or self._current_response
-        if not resp:
-            return
-        
         try:
-            data = json.loads(result_json)
-        except:
-            data = {}
-        
-        raw_output = data.get('output', '')
-        error = data.get('error', '')
-        success = data.get('success', True)
-        
-        # 从格式化的输出中提取执行时间和清理内容
-        # 格式: "输出:\n...\n返回值: ...\n执行时间: 0.123s"
-        exec_time = 0.0
-        clean_parts = []
-        
-        for line in raw_output.split('\n'):
-            time_match = re.match(r'^执行时间:\s*([\d.]+)s$', line.strip())
-            if time_match:
-                exec_time = float(time_match.group(1))
-                continue
-            # 去掉 "输出:" 前缀
-            if line.strip() == '输出:':
-                continue
-            clean_parts.append(line)
-        
-        clean_output = '\n'.join(clean_parts).strip()
-        
-        widget = PythonShellWidget(
-            code=code,
-            output=clean_output,
-            error=error,
-            exec_time=exec_time,
-            success=success,
-            parent=resp
-        )
-        # 放入 Python Shell 折叠区块（而非 details_layout）
-        resp.add_shell_widget(widget)
-        self._scroll_agent_to_bottom()
+            resp = self._agent_response or self._current_response
+            if not resp:
+                return
+            
+            try:
+                data = json.loads(result_json)
+            except Exception:
+                data = {}
+            
+            raw_output = data.get('output', '')
+            error = data.get('error', '')
+            success = data.get('success', True)
+            
+            # 从格式化的输出中提取执行时间和清理内容
+            # 格式: "输出:\n...\n返回值: ...\n执行时间: 0.123s"
+            exec_time = 0.0
+            clean_parts = []
+            
+            for line in raw_output.split('\n'):
+                time_match = re.match(r'^执行时间:\s*([\d.]+)s$', line.strip())
+                if time_match:
+                    exec_time = float(time_match.group(1))
+                    continue
+                # 去掉 "输出:" 前缀
+                if line.strip() == '输出:':
+                    continue
+                clean_parts.append(line)
+            
+            clean_output = '\n'.join(clean_parts).strip()
+            
+            widget = PythonShellWidget(
+                code=code,
+                output=clean_output,
+                error=error,
+                exec_time=exec_time,
+                success=success,
+                parent=resp
+            )
+            # 放入 Python Shell 折叠区块（而非 details_layout）
+            resp.add_shell_widget(widget)
+            self._scroll_agent_to_bottom()
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
 
     @QtCore.Slot(str, str)
     def _on_add_system_shell(self, command: str, result_json: str):
         """处理 execute_shell 的专用 UI 展示"""
-        resp = self._agent_response or self._current_response
-        if not resp:
-            return
-
         try:
-            data = json.loads(result_json)
-        except Exception:
-            data = {}
+            resp = self._agent_response or self._current_response
+            if not resp:
+                return
 
-        raw_output = data.get('output', '')
-        error = data.get('error', '')
-        success = data.get('success', True)
-        cwd = data.get('cwd', '')
+            try:
+                data = json.loads(result_json)
+            except Exception:
+                data = {}
 
-        # 从输出中提取执行时间和退出码
-        exec_time = 0.0
-        exit_code = 0
-        stdout_parts = []
-        stderr_parts = []
+            raw_output = data.get('output', '')
+            error = data.get('error', '')
+            success = data.get('success', True)
+            cwd = data.get('cwd', '')
 
-        for line in raw_output.split('\n'):
-            # 匹配 "退出码: 0, 耗时: 0.123s" 或 "⛔ 命令执行失败: 退出码: 1, 耗时: ..."
-            time_match = re.search(r'耗时:\s*([\d.]+)s', line)
-            code_match = re.search(r'退出码:\s*(\d+)', line)
-            if time_match:
-                exec_time = float(time_match.group(1))
-            if code_match:
-                exit_code = int(code_match.group(1))
-            if time_match or code_match:
-                continue
-            # 分离 stdout / stderr
-            if line.strip() == '--- stdout ---':
-                continue
-            if line.strip() == '--- stderr ---':
-                continue
-            # 简单处理：在 stderr 标记之后的内容归入 stderr
-            stdout_parts.append(line)
+            # 从输出中提取执行时间和退出码
+            exec_time = 0.0
+            exit_code = 0
+            stdout_parts = []
 
-        clean_output = '\n'.join(stdout_parts).strip()
+            for line in raw_output.split('\n'):
+                # 匹配 "退出码: 0, 耗时: 0.123s" 或 "⛔ 命令执行失败: 退出码: 1, 耗时: ..."
+                time_match = re.search(r'耗时:\s*([\d.]+)s', line)
+                code_match = re.search(r'退出码:\s*(\d+)', line)
+                if time_match:
+                    exec_time = float(time_match.group(1))
+                if code_match:
+                    exit_code = int(code_match.group(1))
+                if time_match or code_match:
+                    continue
+                # 分离 stdout / stderr
+                if line.strip() == '--- stdout ---':
+                    continue
+                if line.strip() == '--- stderr ---':
+                    continue
+                stdout_parts.append(line)
 
-        widget = SystemShellWidget(
-            command=command,
-            output=clean_output,
-            error=error,
-            exit_code=exit_code,
-            exec_time=exec_time,
-            success=success,
-            cwd=cwd,
-            parent=resp
-        )
-        resp.add_sys_shell_widget(widget)
-        self._scroll_agent_to_bottom()
+            clean_output = '\n'.join(stdout_parts).strip()
+
+            widget = SystemShellWidget(
+                command=command,
+                output=clean_output,
+                error=error,
+                exit_code=exit_code,
+                exec_time=exec_time,
+                success=success,
+                cwd=cwd,
+                parent=resp
+            )
+            resp.add_sys_shell_widget(widget)
+            self._scroll_agent_to_bottom()
+        except RuntimeError:
+            pass  # widget 已被 clear 销毁
 
     def _on_stop(self):
         self.client.request_stop()
@@ -3197,14 +3239,29 @@ Todo 管理规则（严格遵守）:
             self._update_key_status()
 
     def _on_clear(self):
+        # ── 如果当前 session 正在运行 agent，先停止 ──
+        if self._agent_session_id == self._session_id and self._agent_session_id is not None:
+            # 1) 请求后端线程停止
+            self.client.request_stop()
+            # 2) 断开 agent 对已删除 widget 的引用（防止回调访问已销毁控件）
+            self._agent_response = None
+            self._agent_todo_list = None
+            self._agent_chat_layout = None
+            self._agent_scroll_area = None
+            # 3) 重置运行状态和按钮
+            self._set_running(False)
+        
         self._conversation_history.clear()
         self._context_summary = ""
         self._current_response = None
         self._token_stats = {
             'input_tokens': 0, 'output_tokens': 0,
+            'reasoning_tokens': 0,
             'cache_read': 0, 'cache_write': 0,
             'total_tokens': 0, 'requests': 0,
+            'estimated_cost': 0.0,
         }
+        self._call_records = []
         
         while self.chat_layout.count() > 1:
             item = self.chat_layout.takeAt(0)
@@ -3225,7 +3282,8 @@ Todo 管理规则（严格遵守）:
                 self.session_tabs.setTabText(i, f"Chat {self._session_counter}")
                 break
         
-        # 更新上下文统计
+        # 更新统计显示
+        self._update_token_stats_display()
         self._update_context_stats()
 
     def _on_read_network(self):
@@ -3415,6 +3473,9 @@ Todo 管理规则（严格遵守）:
     
     def _build_cache_data(self) -> dict:
         """构建缓存数据字典"""
+        todo_data = []
+        if hasattr(self, 'todo_list') and self.todo_list:
+            todo_data = self.todo_list.get_todos_data()
         return {
             'version': '1.0',
             'session_id': self._session_id,
@@ -3423,7 +3484,8 @@ Todo 管理规则（严格遵守）:
             'estimated_tokens': self._calculate_context_tokens(),
             'conversation_history': self._conversation_history,
             'context_summary': self._context_summary,
-            'todo_summary': self.todo_list.get_todos_summary() if hasattr(self, 'todo_list') else ""
+            'todo_summary': self.todo_list.get_todos_summary() if hasattr(self, 'todo_list') else "",
+            'todo_data': todo_data,
         }
 
     def _periodic_save_all(self):
@@ -3460,12 +3522,20 @@ Todo 管理规则（严格遵守）:
                 history = sdata.get('conversation_history', [])
                 if not history:
                     continue
+                # 收集 todo 数据
+                todo_list_obj = sdata.get('todo_list')
+                todo_data = []
+                try:
+                    todo_data = todo_list_obj.get_todos_data() if todo_list_obj else []
+                except Exception:
+                    pass
                 cache_data = {
                     'version': '1.0',
                     'session_id': sid,
                     'message_count': len(history),
                     'conversation_history': history,
                     'context_summary': sdata.get('context_summary', ''),
+                    'todo_data': todo_data,
                 }
                 session_file = self._cache_dir / f"session_{sid}.json"
                 with open(session_file, 'w', encoding='utf-8') as f:
@@ -3571,6 +3641,10 @@ Todo 管理规则（严格遵守）:
                 if not history:
                     continue  # 空会话不保存
 
+                # 收集 todo 数据
+                todo_list_obj = sdata.get('todo_list')
+                todo_data = todo_list_obj.get_todos_data() if todo_list_obj else []
+
                 # 写 session 文件
                 cache_data = {
                     'version': '1.0',
@@ -3579,6 +3653,7 @@ Todo 管理规则（严格遵守）:
                     'message_count': len(history),
                     'conversation_history': history,
                     'context_summary': sdata.get('context_summary', ''),
+                    'todo_data': todo_data,
                 }
                 session_file = self._cache_dir / f"session_{sid}.json"
                 with open(session_file, 'w', encoding='utf-8') as f:
@@ -3650,6 +3725,7 @@ Todo 管理规则（严格遵守）:
                     continue
 
                 context_summary = cache_data.get('context_summary', '')
+                todo_data = cache_data.get('todo_data', [])
 
                 if first_tab:
                     # 第一个 tab：加载到已有的初始会话中
@@ -3677,6 +3753,11 @@ Todo 管理规则（严格遵守）:
                             'current_response': None,
                             'token_stats': self._token_stats,
                         }
+
+                    # 恢复 todo 数据
+                    if todo_data and hasattr(self, 'todo_list') and self.todo_list:
+                        self.todo_list.restore_todos(todo_data)
+                        self._ensure_todo_in_chat(self.todo_list, self.chat_layout)
 
                     # 更新标签
                     for i in range(self.session_tabs.count()):
@@ -3706,6 +3787,10 @@ Todo 管理规则（严格遵守）:
                     }
 
                     todo = self._create_todo_list(chat_container)
+                    # 恢复 todo 数据
+                    if todo_data:
+                        todo.restore_todos(todo_data)
+                        self._ensure_todo_in_chat(todo, chat_layout)
 
                     self._sessions[sid] = {
                         'scroll_area': scroll_area,
@@ -3829,6 +3914,7 @@ Todo 管理规则（严格遵守）:
             
             history = cache_data.get('conversation_history', [])
             context_summary = cache_data.get('context_summary', '')
+            todo_data = cache_data.get('todo_data', [])
             cached_session_id = cache_data.get('session_id', str(uuid.uuid4())[:8])
             
             if silent and not self._conversation_history:
@@ -3836,6 +3922,10 @@ Todo 管理规则（严格遵守）:
                 self._conversation_history = history
                 self._context_summary = context_summary
                 self._session_id = cached_session_id
+                # 恢复 todo 数据
+                if todo_data and hasattr(self, 'todo_list') and self.todo_list:
+                    self.todo_list.restore_todos(todo_data)
+                    self._ensure_todo_in_chat(self.todo_list, self.chat_layout)
                 # 更新 sessions 字典
                 if self._session_id in self._sessions:
                     self._sessions[self._session_id]['conversation_history'] = self._conversation_history
@@ -3890,10 +3980,16 @@ Todo 管理规则（严格遵守）:
                 'total_tokens': 0, 'requests': 0,
             }
             
+            todo = self._create_todo_list(chat_container)
+            if todo_data:
+                todo.restore_todos(todo_data)
+                self._ensure_todo_in_chat(todo, chat_layout)
+            
             self._sessions[cached_session_id] = {
                 'scroll_area': scroll_area,
                 'chat_container': chat_container,
                 'chat_layout': chat_layout,
+                'todo_list': todo,
                 'conversation_history': history,
                 'context_summary': context_summary,
                 'current_response': None,
@@ -3909,6 +4005,7 @@ Todo 管理规则（严格遵守）:
             self.scroll_area = scroll_area
             self.chat_container = chat_container
             self.chat_layout = chat_layout
+            self.todo_list = todo
             
             self.session_tabs.blockSignals(True)
             self.session_tabs.setCurrentIndex(tab_index)
@@ -4169,9 +4266,9 @@ Todo 管理规则（严格遵守）:
         1. role="user" 中嵌入 [Network structure] / [Selected nodes] 等上下文
            → 用户文字正常显示，上下文数据放入可折叠区域
         2. role="assistant" 以 [工具执行结果] 开头
-           → 解析每一条 [ok]/[err]/✅/❌ 行，创建 ToolCallItem + 可折叠
+           → 解析每一条 [ok]/[err]/✅/❌ 行，创建折叠式 ToolCallItem
         3. role="tool"（旧缓存格式）
-           → 先 add_tool_call 再 set_tool_result + 可折叠
+           → 先 add_tool_call 再 set_tool_result（折叠式）
         """
         # 清空当前显示（保留末尾 stretch）
         while self.chat_layout.count() > 1:
@@ -4260,11 +4357,41 @@ Todo 管理规则（严格遵守）:
                 i += 1
 
     # ------------------------------------------------------------------
+    def _replay_todo_from_tool_call(self, tool_name: str, arguments_str: str):
+        """从历史工具调用中恢复 todo 项（不显示在 UI 执行列表中）
+        
+        注意：todo 数据现在通过 todo_data 字段在缓存中保存/恢复，
+        此方法仅作为兼容旧缓存的后备方案。
+        """
+        try:
+            if isinstance(arguments_str, str) and arguments_str:
+                args = json.loads(arguments_str)
+            elif isinstance(arguments_str, dict):
+                args = arguments_str
+            else:
+                return
+            if tool_name == 'add_todo':
+                tid = args.get('todo_id', '')
+                text = args.get('text', '')
+                status = args.get('status', 'pending')
+                if tid and text and hasattr(self, 'todo_list') and self.todo_list:
+                    self.todo_list.add_todo(tid, text, status)
+                    self._ensure_todo_in_chat(self.todo_list, self.chat_layout)
+            elif tool_name == 'update_todo':
+                tid = args.get('todo_id', '')
+                status = args.get('status', 'done')
+                if tid and hasattr(self, 'todo_list') and self.todo_list:
+                    self.todo_list.update_todo(tid, status)
+        except Exception:
+            pass  # 解析失败忽略
+
+    # ------------------------------------------------------------------
     def _render_native_tool_turn(self, turn_msgs: list):
         """渲染 Cursor 风格原生工具调用轮次
         
         turn_msgs 格式：
           assistant(tool_calls) → tool → [assistant(tool_calls) → tool →] ... → assistant(reply)
+        静默工具（add_todo/update_todo）不显示在执行列表中，但会恢复 todo 数据。
         """
         response = self._add_ai_response()
         tool_count = 0
@@ -4281,6 +4408,10 @@ Todo 管理规则（严格遵守）:
                     for tc in tc_list:
                         fn = tc.get('function', {})
                         name = fn.get('name', 'unknown')
+                        # 静默工具：恢复 todo 但不显示在执行列表
+                        if name in self._SILENT_TOOLS:
+                            self._replay_todo_from_tool_call(name, fn.get('arguments', ''))
+                            continue
                         response.add_status(f"[tool]{name}")
                         tool_count += 1
                 else:
@@ -4293,14 +4424,12 @@ Todo 管理规则（严格遵守）:
                 t_content = m.get('content', '') or ''
                 # 从 tool_call_id 查找对应的工具名
                 t_name = self._find_tool_name_by_id(turn_msgs, tc_id) or 'tool'
+                # 静默工具的结果也不显示
+                if t_name in self._SILENT_TOOLS:
+                    continue
                 success = not t_content.lstrip().startswith('[err]') and 'error' not in t_content[:50].lower()
                 prefix = "[ok] " if success else "[err] "
-                if len(t_content) <= 200:
-                    response.add_tool_result(t_name, f"{prefix}{t_content}")
-                else:
-                    summary = t_content[:120].replace('\n', ' ') + "..."
-                    response.add_tool_result(t_name, f"{prefix}{summary}")
-                    response.add_collapsible(f"Result: {t_name}", t_content)
+                response.add_tool_result(t_name, f"{prefix}{t_content}")
         
         # 恢复 thinking
         if thinking:
@@ -4433,17 +4562,14 @@ Todo 管理规则（严格遵守）:
             all_parts = [first_result] + cont_lines
             t_result = '\n'.join(all_parts).strip()
 
+            # 静默工具不显示在执行列表
+            if t_name in self._SILENT_TOOLS:
+                continue
             # 注册工具 + 设置结果
             response.add_status(f"[tool]{t_name}")
             tool_count += 1
             result_prefix = "[ok] " if success else "[err] "
-
-            if len(t_result) <= 200:
-                response.add_tool_result(t_name, f"{result_prefix}{t_result}")
-            else:
-                summary = t_result[:120].replace('\n', ' ') + "..."
-                response.add_tool_result(t_name, f"{result_prefix}{summary}")
-                response.add_collapsible(f"Result: {t_name}", t_result)
+            response.add_tool_result(t_name, f"{result_prefix}{t_result}")
 
         # 恢复 Shell 折叠面板
         self._restore_shell_widgets(response, msg)
@@ -4555,17 +4681,15 @@ Todo 管理规则（严格遵守）:
                 t_result = parts[1].strip() if len(parts) > 1 else t_content
             else:
                 t_result = t_content
+            # 静默工具不显示在执行列表
+            if t_name in self._SILENT_TOOLS:
+                continue
             success = not t_result.startswith('[err]') and not t_result.startswith('\u274c')
             # 先注册工具调用
             response.add_status(f"[tool]{t_name}")
             result_prefix = "[ok] " if success else "[err] "
 
-            if len(t_result) <= 200:
-                response.add_tool_result(t_name, f"{result_prefix}{t_result}")
-            else:
-                summary = t_result[:120] + "..."
-                response.add_tool_result(t_name, f"{result_prefix}{summary}")
-                response.add_collapsible(f"Result: {t_name}", t_result)
+            response.add_tool_result(t_name, f"{result_prefix}{t_result}")
 
     # ===== Token 优化管理 =====
     

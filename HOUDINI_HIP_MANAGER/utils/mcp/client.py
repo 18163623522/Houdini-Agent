@@ -1754,7 +1754,23 @@ class HoudiniMCP:
             # 尝试作为元组参数
             parm_tuple = node.parmTuple(param_name)
             if parm_tuple is None:
-                return False, f"未找到参数: {param_name}"
+                # 列出相似参数名帮助 AI 纠正
+                try:
+                    all_parms = [p.name() for p in node.parms()]
+                    hint_lower = param_name.lower()
+                    similar = [p for p in all_parms if hint_lower in p.lower() or p.lower() in hint_lower][:8]
+                    err = f"节点 {node_path} 不存在参数 '{param_name}'"
+                    if similar:
+                        err += f"\n相似参数: {', '.join(similar)}"
+                    else:
+                        # 列出前 15 个参数供参考
+                        sample = all_parms[:15]
+                        err += f"\n该节点可用参数(前15): {', '.join(sample)}"
+                        if len(all_parms) > 15:
+                            err += f" ... 共 {len(all_parms)} 个"
+                except Exception:
+                    err = f"未找到参数: {param_name}"
+                return False, err
             
             if isinstance(value, (list, tuple)):
                 try:
@@ -2771,12 +2787,35 @@ class HoudiniMCP:
                 return f"⛔ 安全拦截: {msg}\n如确需执行，请在 Houdini Python Shell 中手动运行。"
         return None
 
+    # 这些工具出错时应提示 AI 先查阅文档再重试，不要盲目重试
+    _DOC_CHECK_TOOLS: frozenset = frozenset({
+        'create_node',
+        'create_nodes_batch',
+        'create_wrangle_node',
+        'set_node_parameter',
+        'batch_set_parameters',
+        'connect_nodes',
+    })
+
     def _append_usage_hint(self, tool_name: str, error_msg: str) -> str:
-        """在错误消息末尾附加工具的正确调用方式"""
+        """在错误消息末尾附加工具的正确调用方式，以及查阅文档的建议"""
+        parts = [error_msg]
+
         usage = self._TOOL_USAGE.get(tool_name)
         if usage:
-            return f"{error_msg}\n\n正确调用方式: {usage}"
-        return error_msg
+            parts.append(f"正确调用方式: {usage}")
+
+        # 节点创建/参数设置类工具出错 → 强烈建议查阅文档再重试
+        if tool_name in self._DOC_CHECK_TOOLS:
+            parts.append(
+                "⚠️ 请不要盲目重试！先通过以下方式确认正确信息再重新调用:\n"
+                "  1. search_node_types(keyword=\"...\") — 搜索正确的节点类型名\n"
+                "  2. get_houdini_node_doc(node_type=\"...\") — 查阅该节点的参数文档\n"
+                "  3. get_node_parameters(node_path=\"...\") — 查看已有节点的实际参数名和当前值\n"
+                "确认节点类型名、参数名、参数值类型无误后，再重新调用本工具。"
+            )
+
+        return "\n\n".join(parts)
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """执行工具调用 - AI Agent 的统一工具入口（基于分派表）

@@ -22,6 +22,40 @@ def _fmt_duration(seconds: float) -> str:
 
 
 # ============================================================
+# 节点路径 → 可点击链接
+# ============================================================
+
+# 匹配 Houdini 节点路径: /obj/..., /out/..., /ch/..., /shop/..., /stage/..., /mat/..., /tasks/...
+_NODE_PATH_RE = re.compile(
+    r'(?<!["\w/])'                          # 不在引号、字母或 / 之后
+    r'(/(?:obj|out|ch|shop|stage|mat|tasks)(?:/[\w.]+)+)'   # 路径本体
+    r'(?!["\w/])'                           # 不在引号、字母或 / 之前
+)
+
+_NODE_LINK_STYLE = "color:#4ec9b0;text-decoration:none;font-family:Consolas,Monaco,monospace;"
+
+
+def _linkify_node_paths(text: str) -> str:
+    """将文本中的 Houdini 节点路径转换为可点击的 <a> 标签
+    
+    使用 houdini:// 协议，点击后由 Qt 的 linkActivated 信号处理跳转。
+    """
+    return _NODE_PATH_RE.sub(
+        lambda m: f'<a href="houdini://{m.group(1)}" style="{_NODE_LINK_STYLE}">{m.group(1)}</a>',
+        text,
+    )
+
+
+def _linkify_node_paths_plain(text: str) -> str:
+    """将纯文本中的节点路径转换为富文本 HTML（含可点击链接）
+    
+    先 html.escape 再 linkify，保证安全。
+    """
+    escaped = html.escape(text)
+    return _linkify_node_paths(escaped).replace('\n', '<br>')
+
+
+# ============================================================
 # 颜色主题 (深色主题)
 # ============================================================
 
@@ -263,72 +297,43 @@ class ThinkingSection(CollapsibleSection):
 # 工具调用项
 # ============================================================
 
-class ToolCallItem(QtWidgets.QFrame):
-    """单个工具调用卡片 — 状态图标 + 名称 + 耗时 + 可展开结果"""
+class ToolCallItem(CollapsibleSection):
+    """单个工具调用 — CollapsibleSection 风格（与 Result 折叠一致的灰色风格）
     
-    _SUMMARY_LEN = 120  # 摘要截断长度
-    
-    def __init__(self, tool_name: str, parent=None):
-        super().__init__(parent)
-        self.tool_name = tool_name
-        self._result = None
-        self._full_result = ""   # 完整结果文本
-        self._summary = ""       # 摘要文本
-        self._expanded = False   # 是否展开
-        self._success = None
-        self._start_time = time.time()
-        
-        self.setStyleSheet(f"""
-            ToolCallItem {{
-                background: {CursorTheme.BG_SECONDARY};
-                border: 1px solid {CursorTheme.BORDER};
-                margin: 2px 0;
-            }}
-        """)
-        self.setCursor(QtCore.Qt.PointingHandCursor)
-        
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(3)
-        
-        # ---- 标题行: 图标 + 名称 + 展开提示 + 耗时 ----
-        title_row = QtWidgets.QHBoxLayout()
-        title_row.setSpacing(6)
-        
-        self.status_icon = QtWidgets.QLabel("...")
-        self.status_icon.setStyleSheet("font-size: 12px;")
-        self.status_icon.setFixedWidth(18)
-        title_row.addWidget(self.status_icon)
-        
-        self.name_label = QtWidgets.QLabel(tool_name)
-        self.name_label.setWordWrap(True)
-        self.name_label.setStyleSheet(f"""
-            color: {CursorTheme.ACCENT_BEIGE};
+    标题栏：▶ tool_name            （执行中）
+           ▶ tool_name (1.2s)      （完成）
+    展开后显示完整 result 文本，节点路径可点击跳转。
+    """
+
+    nodePathClicked = QtCore.Signal(str)  # 节点路径被点击
+
+    # 统一灰色标题样式（和 CollapsibleSection 默认一致）
+    _HEADER_STYLE = f"""
+        QPushButton {{
+            color: {CursorTheme.TEXT_MUTED};
             font-size: 13px;
             font-family: {CursorTheme.FONT_CODE};
-            font-weight: bold;
-        """)
-        title_row.addWidget(self.name_label, 1)
-        
-        # 展开/收缩提示（长结果才显示）
-        self.expand_hint = QtWidgets.QLabel("")
-        self.expand_hint.setStyleSheet(
-            f"color:{CursorTheme.TEXT_MUTED};font-size:10px;"
-            f"font-family:{CursorTheme.FONT_CODE};"
-        )
-        self.expand_hint.setVisible(False)
-        title_row.addWidget(self.expand_hint)
-        
-        self.duration_label = QtWidgets.QLabel("")
-        self.duration_label.setStyleSheet(
-            f"color:{CursorTheme.TEXT_MUTED};font-size:11px;"
-            f"font-family:{CursorTheme.FONT_CODE};"
-        )
-        title_row.addWidget(self.duration_label)
-        
-        layout.addLayout(title_row)
-        
-        # ---- 进度条 ----
+            text-align: left;
+            padding: 3px 8px;
+            border: none;
+            background: transparent;
+        }}
+        QPushButton:hover {{
+            background: {CursorTheme.BG_HOVER};
+            color: {CursorTheme.TEXT_PRIMARY};
+        }}
+    """
+
+    def __init__(self, tool_name: str, parent=None):
+        super().__init__(tool_name, icon="", collapsed=True, parent=parent)
+        self.tool_name = tool_name
+        self._result = None
+        self._success = None
+        self._start_time = time.time()
+
+        self.header.setStyleSheet(self._HEADER_STYLE)
+
+        # 进度条（嵌入 content_layout 顶部，执行完毕后隐藏）
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setFixedHeight(2)
         self.progress_bar.setRange(0, 0)  # indeterminate
@@ -342,91 +347,63 @@ class ToolCallItem(QtWidgets.QFrame):
                 background: {CursorTheme.ACCENT_BEIGE};
             }}
         """)
-        layout.addWidget(self.progress_bar)
-        
-        # ---- 结果区域（初始隐藏） ----
-        self.result_label = QtWidgets.QLabel()
-        self.result_label.setWordWrap(True)
-        self.result_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.result_label.setVisible(False)
-        self.result_label.setStyleSheet(f"""
-            color: {CursorTheme.TEXT_MUTED};
-            font-size: 12px;
-            padding: 2px 0 0 24px;
-            font-family: {CursorTheme.FONT_CODE};
-        """)
-        layout.addWidget(self.result_label)
-    
-    def mousePressEvent(self, event):
-        """点击卡片切换展开/收缩"""
-        if self._full_result and len(self._full_result) > self._SUMMARY_LEN:
-            self._expanded = not self._expanded
-            self._update_result_display()
-        super().mousePressEvent(event)
-    
-    def _update_result_display(self):
-        """根据展开状态更新结果显示"""
-        if self._expanded:
-            self.result_label.setText(self._full_result)
-            self.expand_hint.setText("[collapse]")
-        else:
-            self.result_label.setText(self._summary)
-            self.expand_hint.setText("[expand]")
-    
+        self.content_layout.addWidget(self.progress_bar)
+
+        self._result_label = None
+
     def set_result(self, result: str, success: bool = True):
         """设置工具执行结果"""
         self._result = result
         self._success = success
-        self._full_result = result
         elapsed = time.time() - self._start_time
-        
+
         # 隐藏进度条
         self.progress_bar.setVisible(False)
-        
-        # 更新图标和耗时
-        if success:
-            self.status_icon.setText("ok")
-            self.status_icon.setStyleSheet(f"color: {CursorTheme.ACCENT_GREEN}; font-size: 11px; font-family: {CursorTheme.FONT_CODE};")
-            self.setStyleSheet(f"""
-                ToolCallItem {{
-                    background: {CursorTheme.BG_SECONDARY};
-                    border: 1px solid #3a3a30;
-                    border-left: 3px solid {CursorTheme.ACCENT_BEIGE};
-                    margin: 2px 0;
-                }}
-            """)
-        else:
-            self.status_icon.setText("err")
-            self.status_icon.setStyleSheet(f"color: {CursorTheme.ACCENT_RED}; font-size: 11px; font-family: {CursorTheme.FONT_CODE};")
-            self.setStyleSheet(f"""
-                ToolCallItem {{
-                    background: {CursorTheme.BG_SECONDARY};
-                    border: 1px solid #4a2a2a;
-                    border-left: 3px solid {CursorTheme.ACCENT_RED};
-                    margin: 2px 0;
-                }}
-            """)
-        
-        self.duration_label.setText(f"{elapsed:.1f}s")
-        
-        # 构建摘要和完整内容
-        if len(result) > self._SUMMARY_LEN:
-            self._summary = result[:self._SUMMARY_LEN] + "..."
-            self.expand_hint.setText("[expand]")
-            self.expand_hint.setVisible(True)
-        else:
-            self._summary = result
-        
-        self.result_label.setText(self._summary)
-        self.result_label.setVisible(True)
-        
+
+        # 更新标题：只显示工具名 + 耗时，无图标
+        self.set_title(f"{self.tool_name} ({elapsed:.1f}s)")
+
+        # 失败时标题用白色（更亮），成功保持灰色
         if not success:
-            self.result_label.setStyleSheet(f"""
-                color: {CursorTheme.ACCENT_RED};
+            self.header.setStyleSheet(f"""
+                QPushButton {{
+                    color: {CursorTheme.TEXT_BRIGHT};
+                    font-size: 13px;
+                    font-family: {CursorTheme.FONT_CODE};
+                    text-align: left;
+                    padding: 3px 8px;
+                    border: none;
+                    background: transparent;
+                }}
+                QPushButton:hover {{
+                    background: {CursorTheme.BG_HOVER};
+                }}
+            """)
+
+        # 添加结果文本（灰色，失败时白色）—— 节点路径可点击
+        if result.strip():
+            text_color = CursorTheme.TEXT_MUTED if success else CursorTheme.TEXT_BRIGHT
+            rich_html = _linkify_node_paths_plain(result)
+            self._result_label = QtWidgets.QLabel(rich_html)
+            self._result_label.setWordWrap(True)
+            self._result_label.setTextFormat(QtCore.Qt.RichText)
+            self._result_label.setOpenExternalLinks(False)
+            self._result_label.setTextInteractionFlags(
+                QtCore.Qt.TextSelectableByMouse | QtCore.Qt.LinksAccessibleByMouse
+            )
+            self._result_label.linkActivated.connect(self._on_result_link)
+            self._result_label.setStyleSheet(f"""
+                color: {text_color};
                 font-size: 12px;
-                padding: 2px 0 0 24px;
+                padding: 2px 4px;
                 font-family: {CursorTheme.FONT_CODE};
             """)
+            self.content_layout.addWidget(self._result_label)
+
+    def _on_result_link(self, url: str):
+        """工具结果中的链接被点击"""
+        if url.startswith('houdini://'):
+            self.nodePathClicked.emit(url[len('houdini://'):])
 
 
 # ============================================================
@@ -435,7 +412,9 @@ class ToolCallItem(QtWidgets.QFrame):
 
 class ExecutionSection(CollapsibleSection):
     """执行过程 - 卡片式工具调用显示（默认折叠，用户手动展开）"""
-    
+
+    nodePathClicked = QtCore.Signal(str)  # 从子 ToolCallItem 冒泡上来
+
     def __init__(self, parent=None):
         super().__init__("执行中...", icon="", collapsed=True, parent=parent)
         self._tool_calls: List[ToolCallItem] = []
@@ -460,6 +439,7 @@ class ExecutionSection(CollapsibleSection):
     def add_tool_call(self, tool_name: str) -> ToolCallItem:
         """添加工具调用"""
         item = ToolCallItem(tool_name, self)
+        item.nodePathClicked.connect(self.nodePathClicked.emit)
         self._tool_calls.append(item)
         self.content_layout.addWidget(item)
         self._update_title()
@@ -493,8 +473,8 @@ class ExecutionSection(CollapsibleSection):
         for item in self._tool_calls:
             if item._result is None:
                 item.progress_bar.setVisible(False)
-                item.status_icon.setText("ok")
-                item.duration_label.setText(f"{time.time() - item._start_time:.1f}s")
+                item_elapsed = time.time() - item._start_time
+                item.set_title(f"{item.tool_name} ({item_elapsed:.1f}s)")
                 item._result = ""  # 标记已完成，避免被重复处理
                 item._success = True
         
@@ -552,6 +532,7 @@ class AIResponse(QtWidgets.QWidget):
     """
     
     createWrangleRequested = QtCore.Signal(str)  # vex_code
+    nodePathClicked = QtCore.Signal(str)         # 节点路径被点击
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -573,6 +554,7 @@ class AIResponse(QtWidgets.QWidget):
         # === 执行过程区块 ===
         self.execution_section = ExecutionSection(self)
         self.execution_section.setVisible(False)
+        self.execution_section.nodePathClicked.connect(self.nodePathClicked.emit)
         layout.addWidget(self.execution_section)
         
         # === Python Shell 区块（可折叠，默认折叠）===
@@ -864,14 +846,21 @@ class AIResponse(QtWidgets.QWidget):
             """)
         else:
             # 始终显示完整回复内容（不折叠）
-            if SimpleMarkdown.has_rich_content(content):
+            has_node_path = bool(_NODE_PATH_RE.search(content))
+            if SimpleMarkdown.has_rich_content(content) or has_node_path:
                 self.content_label.setVisible(False)
                 rich = RichContentWidget(content, self.summary_frame)
                 rich.createWrangleRequested.connect(self.createWrangleRequested.emit)
+                rich.nodePathClicked.connect(self.nodePathClicked.emit)
                 self.summary_frame.layout().addWidget(rich)
             else:
                 self.content_label.setText(content)
     
+    def _on_link_activated(self, url: str):
+        """处理链接点击 — houdini:// 协议 → nodePathClicked 信号"""
+        if url.startswith('houdini://'):
+            node_path = url[len('houdini://'):]
+            self.nodePathClicked.emit(node_path)
 
 
 # ============================================================
@@ -1484,7 +1473,7 @@ class SimpleMarkdown:
 
     @classmethod
     def _inline(cls, text: str) -> str:
-        """行内格式: **粗体**, *斜体*, ~~删除线~~, `代码`, [链接](url)"""
+        """行内格式: **粗体**, *斜体*, ~~删除线~~, `代码`, [链接](url), 节点路径"""
         text = html.escape(text)
         # 链接 [text](url)
         text = re.sub(
@@ -1506,6 +1495,8 @@ class SimpleMarkdown:
             r'font-size:0.9em;border:1px solid #3a3a4a;">\1</code>',
             text,
         )
+        # Houdini 节点路径 → 可点击链接
+        text = _linkify_node_paths(text)
         return text
 
 
@@ -1646,6 +1637,146 @@ class SyntaxHighlighter:
 
 
 # ============================================================
+# 可折叠 Shell 输出区域（Python Shell / System Shell 共用）
+# ============================================================
+
+class _CollapsibleShellOutput(QtWidgets.QWidget):
+    """可折叠的 Shell 输出区域
+    
+    - 默认折叠：只显示 4 行，滚轮穿透到父窗口
+    - 展开后：显示全部内容，滚轮可滚动内联区域
+    """
+
+    _COLLAPSED_LINES = 4
+    _MAX_EXPANDED_H = 400  # 展开后最大高度
+
+    def __init__(self, content_html: str, bg_color: str = "#141428",
+                 parent=None):
+        super().__init__(parent)
+        self._collapsed = True
+        self._full_h = 0
+        self._collapsed_h = 0
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # ── QTextEdit（输出内容）──
+        self._text = QtWidgets.QTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setLineWrapMode(QtWidgets.QTextEdit.NoWrap)
+        self._text.setStyleSheet(f"""
+            QTextEdit {{
+                background: {bg_color};
+                color: {CursorTheme.TEXT_PRIMARY};
+                border: none;
+                padding: 6px 8px;
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                font-size: 12px;
+            }}
+            QTextEdit QScrollBar:vertical {{ width:5px; background:transparent; }}
+            QTextEdit QScrollBar::handle:vertical {{ background:#3c3c3c; border-radius:2px; }}
+            QTextEdit QScrollBar:horizontal {{ height:5px; background:transparent; }}
+            QTextEdit QScrollBar::handle:horizontal {{ background:#3c3c3c; border-radius:2px; }}
+        """)
+        self._text.setHtml(
+            f'<pre style="margin:0;white-space:pre;font-family:Consolas,Monaco,monospace;'
+            f'font-size:12px;">{content_html}</pre>'
+        )
+        lay.addWidget(self._text)
+
+        # 计算尺寸
+        doc = self._text.document()
+        doc.setDocumentMargin(4)
+        self._full_h = int(doc.size().height()) + 16
+
+        # 计算折叠高度（4 行）
+        fm = self._text.fontMetrics()
+        line_h = fm.lineSpacing() if fm.lineSpacing() > 0 else 17
+        self._collapsed_h = self._COLLAPSED_LINES * line_h + 16  # 16 = padding
+
+        # 判断是否需要折叠（内容不足 4 行则不折叠）
+        self._needs_collapse = self._full_h > self._collapsed_h + line_h
+
+        if self._needs_collapse:
+            # 初始折叠状态
+            self._text.setFixedHeight(self._collapsed_h)
+            self._text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self._text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            # 安装事件过滤器拦截滚轮
+            self._text.viewport().installEventFilter(self)
+
+            # 计算总行数
+            total_lines = content_html.count('<br>') + content_html.count('\n') + 1
+            remaining = max(0, total_lines - self._COLLAPSED_LINES)
+
+            # ── 展开/收起 toggle bar ──
+            self._toggle = QtWidgets.QLabel(
+                f"  ▼ 展开 ({remaining} 更多行)"
+            )
+            self._toggle.setCursor(QtCore.Qt.PointingHandCursor)
+            self._toggle.setStyleSheet(f"""
+                QLabel {{
+                    background: {bg_color};
+                    color: {CursorTheme.ACCENT_BLUE};
+                    font-size: 11px;
+                    padding: 3px 8px;
+                    border-top: 1px solid {CursorTheme.BORDER};
+                    font-family: {CursorTheme.FONT_CODE};
+                }}
+                QLabel:hover {{
+                    color: {CursorTheme.TEXT_PRIMARY};
+                    background: #1e1e3e;
+                }}
+            """)
+            self._toggle.mousePressEvent = lambda e: self._toggle_collapse()
+            self._toggle.setFixedHeight(22)
+            lay.addWidget(self._toggle)
+            self._remaining = remaining
+        else:
+            # 内容较短，不需要折叠，直接显示全部
+            h = min(self._full_h, self._MAX_EXPANDED_H)
+            self._text.setFixedHeight(h)
+            self._text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self._text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+
+    def _toggle_collapse(self):
+        """切换折叠/展开"""
+        self._collapsed = not self._collapsed
+        if self._collapsed:
+            # 折叠
+            self._text.setFixedHeight(self._collapsed_h)
+            self._text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self._text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self._text.verticalScrollBar().setValue(0)
+            self._toggle.setText(f"  ▼ 展开 ({self._remaining} 更多行)")
+        else:
+            # 展开
+            h = min(self._full_h, self._MAX_EXPANDED_H)
+            self._text.setFixedHeight(h)
+            if self._full_h > self._MAX_EXPANDED_H:
+                self._text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            else:
+                self._text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self._text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            self._toggle.setText("  ▲ 收起")
+
+    def eventFilter(self, obj, event):
+        """折叠状态下，滚轮事件穿透到父窗口"""
+        if (event.type() == QtCore.QEvent.Wheel
+                and self._collapsed and self._needs_collapse):
+            # 把滚轮事件转发给父 ScrollArea
+            parent = self.parent()
+            while parent:
+                if isinstance(parent, QtWidgets.QScrollArea):
+                    QtWidgets.QApplication.sendEvent(parent.viewport(), event)
+                    return True
+                parent = parent.parent()
+            return True  # 即使没找到也吃掉，避免内联滚动
+        return super().eventFilter(obj, event)
+
+
+# ============================================================
 # Python Shell 执行窗口
 # ============================================================
 
@@ -1734,18 +1865,11 @@ class PythonShellWidget(QtWidgets.QFrame):
         code_widget.setFixedHeight(code_h)
         layout.addWidget(code_widget)
         
-        # ---- 输出区域 ----
+        # ---- 输出区域（可折叠）----
         has_output = bool(output and output.strip())
         has_error = bool(error and error.strip())
         
         if has_output or has_error:
-            output_widget = QtWidgets.QTextEdit()
-            output_widget.setReadOnly(True)
-            output_widget.setLineWrapMode(QtWidgets.QTextEdit.NoWrap)
-            output_widget.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-            output_widget.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-            
-            # 拼装输出内容
             parts = []
             if has_output:
                 parts.append(f'<span style="color:{CursorTheme.TEXT_PRIMARY};">'
@@ -1753,36 +1877,10 @@ class PythonShellWidget(QtWidgets.QFrame):
             if has_error:
                 parts.append(f'<span style="color:{CursorTheme.ACCENT_RED};">'
                              f'{html.escape(error.strip())}</span>')
-            
             content_html = '<br>'.join(parts)
-            output_widget.setHtml(
-                f'<pre style="margin:0;white-space:pre;font-family:Consolas,Monaco,monospace;'
-                f'font-size:12px;">{content_html}</pre>'
-            )
-            
-            output_widget.setStyleSheet(f"""
-                QTextEdit {{
-                    background: #141428;
-                    color: {CursorTheme.TEXT_PRIMARY};
-                    border: none;
-                    padding: 6px 8px;
-                    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-                    font-size: 12px;
-                }}
-                QTextEdit QScrollBar:vertical {{ width:5px; background:transparent; }}
-                QTextEdit QScrollBar::handle:vertical {{ background:#3c3c3c; border-radius:2px; }}
-                QTextEdit QScrollBar:horizontal {{ height:5px; background:transparent; }}
-                QTextEdit QScrollBar::handle:horizontal {{ background:#3c3c3c; border-radius:2px; }}
-            """)
-            
-            doc2 = output_widget.document()
-            doc2.setDocumentMargin(4)
-            out_h = min(int(doc2.size().height()) + 16, 200)
-            output_widget.setFixedHeight(out_h)
-            layout.addWidget(output_widget)
+            layout.addWidget(_CollapsibleShellOutput(content_html, "#141428", self))
         
         elif not success:
-            # 没有输出也没有错误但失败了
             err_label = QtWidgets.QLabel("执行失败（无详细信息）")
             err_label.setStyleSheet(
                 f"color:{CursorTheme.ACCENT_RED};font-size:12px;padding:6px 8px;"
@@ -1892,17 +1990,11 @@ class SystemShellWidget(QtWidgets.QFrame):
         cmd_widget.setFixedHeight(cmd_h)
         layout.addWidget(cmd_widget)
 
-        # ---- 输出区域 ----
+        # ---- 输出区域（可折叠）----
         has_output = bool(output and output.strip())
         has_error = bool(error and error.strip())
 
         if has_output or has_error:
-            output_widget = QtWidgets.QTextEdit()
-            output_widget.setReadOnly(True)
-            output_widget.setLineWrapMode(QtWidgets.QTextEdit.NoWrap)
-            output_widget.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-            output_widget.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-
             parts = []
             if has_output:
                 parts.append(f'<span style="color:{CursorTheme.TEXT_PRIMARY};">'
@@ -1910,33 +2002,8 @@ class SystemShellWidget(QtWidgets.QFrame):
             if has_error:
                 parts.append(f'<span style="color:{CursorTheme.ACCENT_RED};">'
                              f'{_html.escape(error.strip())}</span>')
-
             content_html = '<br>'.join(parts)
-            output_widget.setHtml(
-                f'<pre style="margin:0;white-space:pre;font-family:Consolas,Monaco,monospace;'
-                f'font-size:12px;">{content_html}</pre>'
-            )
-
-            output_widget.setStyleSheet(f"""
-                QTextEdit {{
-                    background: #141414;
-                    color: {CursorTheme.TEXT_PRIMARY};
-                    border: none;
-                    padding: 6px 8px;
-                    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-                    font-size: 12px;
-                }}
-                QTextEdit QScrollBar:vertical {{ width:5px; background:transparent; }}
-                QTextEdit QScrollBar::handle:vertical {{ background:#3c3c3c; border-radius:2px; }}
-                QTextEdit QScrollBar:horizontal {{ height:5px; background:transparent; }}
-                QTextEdit QScrollBar::handle:horizontal {{ background:#3c3c3c; border-radius:2px; }}
-            """)
-
-            doc2 = output_widget.document()
-            doc2.setDocumentMargin(4)
-            out_h = min(int(doc2.size().height()) + 16, 250)
-            output_widget.setFixedHeight(out_h)
-            layout.addWidget(output_widget)
+            layout.addWidget(_CollapsibleShellOutput(content_html, "#141414", self))
 
         elif not success:
             err_label = QtWidgets.QLabel("命令执行失败（无详细信息）")
@@ -2094,9 +2161,11 @@ class RichContentWidget(QtWidgets.QWidget):
     - 文本段落紧凑、行高舒适
     - 代码块与正文之间有清晰分隔
     - 表格、链接、列表等完整支持
+    - Houdini 节点路径自动变为可点击链接
     """
 
     createWrangleRequested = QtCore.Signal(str)
+    nodePathClicked = QtCore.Signal(str)  # 节点路径被点击
 
     # 正文 QLabel 通用样式
     _TEXT_STYLE = f"""
@@ -2126,18 +2195,27 @@ class RichContentWidget(QtWidgets.QWidget):
                 lbl = QtWidgets.QLabel()
                 lbl.setWordWrap(True)
                 lbl.setTextFormat(QtCore.Qt.RichText)
-                lbl.setOpenExternalLinks(True)
+                lbl.setOpenExternalLinks(False)  # 我们自己处理链接
                 lbl.setTextInteractionFlags(
                     QtCore.Qt.TextSelectableByMouse
                     | QtCore.Qt.LinksAccessibleByMouse
                 )
                 lbl.setText(seg[1])
                 lbl.setStyleSheet(self._TEXT_STYLE)
+                lbl.linkActivated.connect(self._on_link)
                 layout.addWidget(lbl)
             elif seg[0] == 'code':
                 cb = CodeBlockWidget(seg[2], seg[1], self)
                 cb.createWrangleRequested.connect(self.createWrangleRequested.emit)
                 layout.addWidget(cb)
+
+    def _on_link(self, url: str):
+        """处理链接点击"""
+        if url.startswith('houdini://'):
+            self.nodePathClicked.emit(url[len('houdini://'):])
+        else:
+            # 外部链接用浏览器打开
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
 
 # ============================================================
@@ -2554,6 +2632,24 @@ class TodoList(QtWidgets.QWidget):
             for todo_id, item in self._todos.items()
         ]
     
+    def get_todos_data(self) -> list:
+        """返回可序列化的 todo 列表（用于缓存保存/恢复）"""
+        return [
+            {"id": todo_id, "text": item.text, "status": item.status}
+            for todo_id, item in self._todos.items()
+        ]
+
+    def restore_todos(self, todos_data: list):
+        """从序列化数据恢复 todo 列表"""
+        if not todos_data:
+            return
+        for td in todos_data:
+            tid = td.get('id', '')
+            text = td.get('text', '')
+            status = td.get('status', 'pending')
+            if tid and text:
+                self.add_todo(tid, text, status)
+
     def get_todos_summary(self) -> str:
         if not self._todos:
             return ""
@@ -2612,16 +2708,25 @@ class _BarWidget(QtWidgets.QWidget):
 
 
 class TokenAnalyticsPanel(QtWidgets.QDialog):
-    """Token 使用分析面板 - 显示每次 API 调用的详细统计"""
+    """Token 使用分析面板 - 对齐 Cursor 风格
+    
+    新增：
+    - 预估费用（按实际模型定价）
+    - 推理 Token（Reasoning）
+    - 延迟（Latency）
+    - 每行费用
+    """
 
-    _COL_HEADERS = ["#", "时间", "模型", "Input", "Cache Hit", "Cache Write", "Output", "Total", ""]
-    _COL_STRETCH = [0, 0, 1, 0, 0, 0, 0, 0, 1]
+    _COL_HEADERS = [
+        "#", "时间", "模型", "Input", "Cache↓", "Cache↑",
+        "Output", "Think", "Total", "延迟", "费用", "",
+    ]
 
     def __init__(self, call_records: list, token_stats: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("API 调用分析")
-        self.setMinimumSize(780, 520)
-        self.resize(860, 600)
+        self.setWindowTitle("Token 使用分析")
+        self.setMinimumSize(920, 560)
+        self.resize(1020, 640)
         self.setStyleSheet(f"""
             QDialog {{
                 background: {CursorTheme.BG_PRIMARY};
@@ -2641,8 +2746,28 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
         root.addWidget(self._build_table(call_records), 1)
 
         # ---- 底部按钮 ----
+        self.should_reset_stats = False
         foot = QtWidgets.QHBoxLayout()
         foot.setContentsMargins(0, 0, 0, 0)
+
+        reset_btn = QtWidgets.QPushButton("重置统计")
+        reset_btn.setFixedWidth(82)
+        reset_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {CursorTheme.ACCENT_ORANGE};
+                border: 1px solid {CursorTheme.ACCENT_ORANGE};
+                border-radius: 4px;
+                padding: 5px 0;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{
+                background: rgba(255,150,50,0.12);
+            }}
+        """)
+        reset_btn.clicked.connect(self._on_reset)
+        foot.addWidget(reset_btn)
+
         foot.addStretch()
         close_btn = QtWidgets.QPushButton("关闭")
         close_btn.setFixedWidth(72)
@@ -2663,6 +2788,11 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
         foot.addWidget(close_btn)
         root.addLayout(foot)
 
+    def _on_reset(self):
+        """用户点击了重置按钮"""
+        self.should_reset_stats = True
+        self.accept()
+
     # -------- 摘要区 --------
     def _build_summary(self, records, stats) -> QtWidgets.QWidget:
         card = QtWidgets.QFrame()
@@ -2675,34 +2805,51 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
         """)
         grid = QtWidgets.QGridLayout(card)
         grid.setContentsMargins(16, 12, 16, 12)
-        grid.setHorizontalSpacing(32)
+        grid.setHorizontalSpacing(24)
         grid.setVerticalSpacing(8)
 
         total_in = stats.get('input_tokens', 0)
         total_out = stats.get('output_tokens', 0)
+        reasoning = stats.get('reasoning_tokens', 0)
         cache_r = stats.get('cache_read', 0)
         cache_w = stats.get('cache_write', 0)
         reqs = stats.get('requests', 0)
         total = stats.get('total_tokens', 0)
+        cost = stats.get('estimated_cost', 0.0)
         cache_total = cache_r + cache_w
         hit_rate = (cache_r / cache_total * 100) if cache_total > 0 else 0
 
+        # 平均延迟
+        latencies = [r.get('latency', 0) for r in records if r.get('latency', 0) > 0]
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+
+        # 费用格式化
+        if cost >= 1.0:
+            cost_str = f"${cost:.2f}"
+        elif cost > 0:
+            cost_str = f"${cost:.4f}"
+        else:
+            cost_str = "$0.00"
+
         metrics = [
-            ("Total Requests", f"{reqs}", CursorTheme.ACCENT_BLUE),
-            ("Input Tokens", self._fmt_k(total_in), CursorTheme.ACCENT_PURPLE),
-            ("Output Tokens", self._fmt_k(total_out), CursorTheme.ACCENT_GREEN),
-            ("Cache Hit", self._fmt_k(cache_r), "#4ec9b0"),
-            ("Cache Write", self._fmt_k(cache_w), CursorTheme.ACCENT_ORANGE),
-            ("Hit Rate", f"{hit_rate:.1f}%", CursorTheme.ACCENT_YELLOW),
+            ("Requests",       f"{reqs}",               CursorTheme.ACCENT_BLUE),
+            ("Input",          self._fmt_k(total_in),    CursorTheme.ACCENT_PURPLE),
+            ("Output",         self._fmt_k(total_out),   CursorTheme.ACCENT_GREEN),
+            ("Reasoning",      self._fmt_k(reasoning),   CursorTheme.ACCENT_YELLOW),
+            ("Cache Hit",      self._fmt_k(cache_r),     "#4ec9b0"),
+            ("Hit Rate",       f"{hit_rate:.1f}%",       "#4ec9b0"),
+            ("Avg Latency",    f"{avg_latency:.1f}s",    CursorTheme.TEXT_SECONDARY),
+            ("Est. Cost",      cost_str,                 CursorTheme.ACCENT_BLUE),
         ]
         for col, (label, value, color) in enumerate(metrics):
             lbl = QtWidgets.QLabel(label)
-            lbl.setStyleSheet(f"color:{CursorTheme.TEXT_MUTED};font-size:11px;border:none;")
+            lbl.setStyleSheet(f"color:{CursorTheme.TEXT_MUTED};font-size:10px;border:none;")
             lbl.setAlignment(QtCore.Qt.AlignCenter)
             grid.addWidget(lbl, 0, col)
 
             val = QtWidgets.QLabel(value)
-            val.setStyleSheet(f"color:{color};font-size:18px;font-weight:bold;font-family:'Consolas','Monaco',monospace;border:none;")
+            fs = "16px" if col < 6 else "15px"
+            val.setStyleSheet(f"color:{color};font-size:{fs};font-weight:bold;font-family:'Consolas','Monaco',monospace;border:none;")
             val.setAlignment(QtCore.Qt.AlignCenter)
             grid.addWidget(val, 1, col)
 
@@ -2712,7 +2859,8 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
                 (cache_r, "#4ec9b0"),
                 (cache_w, CursorTheme.ACCENT_ORANGE),
                 (max(total_in - cache_r - cache_w, 0), CursorTheme.ACCENT_PURPLE),
-                (total_out, CursorTheme.ACCENT_GREEN),
+                (reasoning, CursorTheme.ACCENT_YELLOW),
+                (max(total_out - reasoning, 0), CursorTheme.ACCENT_GREEN),
             ], total)
             bar.setFixedHeight(8)
             grid.addWidget(bar, 2, 0, 1, len(metrics))
@@ -2796,27 +2944,31 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
 
         return container
 
+    # 列宽定义
+    _COL_WIDTHS = [24, 50, 90, 54, 54, 54, 54, 48, 54, 44, 52, 0]
+
     def _make_row_widget(self, cells: list, is_header=False) -> QtWidgets.QWidget:
         """创建一行（表头或数据行）"""
         row_w = QtWidgets.QWidget()
         row_h = QtWidgets.QHBoxLayout(row_w)
         row_h.setContentsMargins(4, 3, 4, 3)
-        row_h.setSpacing(4)
+        row_h.setSpacing(2)
 
-        font_size = "11px" if is_header else "12px"
+        font_size = "10px" if is_header else "11px"
         fg = CursorTheme.TEXT_MUTED if is_header else CursorTheme.TEXT_PRIMARY
         weight = "bold" if is_header else "normal"
         font_family = f"font-family:'Consolas','Monaco',monospace;" if not is_header else ""
 
-        widths = [28, 54, 100, 64, 64, 64, 64, 64, 0]  # 0 = stretch
+        widths = self._COL_WIDTHS
 
         for i, text in enumerate(cells):
             lbl = QtWidgets.QLabel(str(text))
-            lbl.setStyleSheet(f"color:{fg};font-size:{font_size};font-weight:{weight};{font_family}border:none;padding:0 2px;")
-            if widths[i] > 0:
+            lbl.setStyleSheet(f"color:{fg};font-size:{font_size};font-weight:{weight};{font_family}border:none;padding:0 1px;")
+            if i < len(widths) and widths[i] > 0:
                 lbl.setFixedWidth(widths[i])
-            lbl.setAlignment(QtCore.Qt.AlignRight if i >= 3 and i <= 7 else QtCore.Qt.AlignLeft)
-            if widths[i] == 0:
+            # 数字列右对齐
+            lbl.setAlignment(QtCore.Qt.AlignRight if 3 <= i <= 10 else QtCore.Qt.AlignLeft)
+            if i < len(widths) and widths[i] == 0:
                 row_h.addWidget(lbl, 1)
             else:
                 row_h.addWidget(lbl)
@@ -2837,21 +2989,40 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
         """)
         row_h = QtWidgets.QHBoxLayout(row_w)
         row_h.setContentsMargins(4, 2, 4, 2)
-        row_h.setSpacing(4)
+        row_h.setSpacing(2)
 
         ts = rec.get('timestamp', '')
-        # 只显示 HH:MM:SS
         if len(ts) > 10:
             ts = ts[11:19]
         model = rec.get('model', '-')
-        # 截短模型名
-        if len(model) > 14:
-            model = model[:12] + '..'
+        if len(model) > 12:
+            model = model[:10] + '..'
         inp = rec.get('input_tokens', 0)
         c_hit = rec.get('cache_hit', 0)
         c_miss = rec.get('cache_miss', 0)
         out = rec.get('output_tokens', 0)
+        reasoning = rec.get('reasoning_tokens', 0)
         total = rec.get('total_tokens', 0)
+        latency = rec.get('latency', 0)
+
+        # 单次费用（优先使用预计算值）
+        row_cost = rec.get('estimated_cost', 0.0)
+        if not row_cost:
+            try:
+                from HOUDINI_HIP_MANAGER.utils.token_optimizer import calculate_cost
+                row_cost = calculate_cost(
+                    model=rec.get('model', ''),
+                    input_tokens=inp,
+                    output_tokens=out,
+                    cache_hit=c_hit,
+                    cache_miss=c_miss,
+                    reasoning_tokens=reasoning,
+                )
+            except Exception:
+                row_cost = 0.0
+
+        cost_str = f"${row_cost:.4f}" if row_cost > 0 else "-"
+        latency_str = f"{latency:.1f}s" if latency > 0 else "-"
 
         cells = [
             str(idx + 1),
@@ -2861,28 +3032,36 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
             self._fmt_k(c_hit),
             self._fmt_k(c_miss),
             self._fmt_k(out),
+            self._fmt_k(reasoning) if reasoning > 0 else "-",
             self._fmt_k(total),
+            latency_str,
+            cost_str,
         ]
-        widths = [28, 54, 100, 64, 64, 64, 64, 64]
+        widths = self._COL_WIDTHS[:-1]  # 除去最后的 stretch
         colors = [
-            CursorTheme.TEXT_MUTED,
-            CursorTheme.TEXT_MUTED,
-            CursorTheme.TEXT_PRIMARY,
-            CursorTheme.ACCENT_PURPLE,
-            "#4ec9b0",
-            CursorTheme.ACCENT_ORANGE,
-            CursorTheme.ACCENT_GREEN,
-            CursorTheme.TEXT_BRIGHT,
+            CursorTheme.TEXT_MUTED,       # #
+            CursorTheme.TEXT_MUTED,       # 时间
+            CursorTheme.TEXT_PRIMARY,     # 模型
+            CursorTheme.ACCENT_PURPLE,    # Input
+            "#4ec9b0",                    # Cache Hit
+            CursorTheme.ACCENT_ORANGE,    # Cache Write
+            CursorTheme.ACCENT_GREEN,     # Output
+            CursorTheme.ACCENT_YELLOW,    # Reasoning
+            CursorTheme.TEXT_BRIGHT,      # Total
+            CursorTheme.TEXT_SECONDARY,   # 延迟
+            CursorTheme.ACCENT_BLUE,      # 费用
         ]
         for i, text in enumerate(cells):
             lbl = QtWidgets.QLabel(text)
-            lbl.setFixedWidth(widths[i])
+            if i < len(widths):
+                lbl.setFixedWidth(widths[i])
             align = QtCore.Qt.AlignRight if i >= 3 else QtCore.Qt.AlignLeft
             lbl.setAlignment(align)
+            c = colors[i] if i < len(colors) else CursorTheme.TEXT_PRIMARY
             lbl.setStyleSheet(
-                f"color:{colors[i]};font-size:12px;"
+                f"color:{c};font-size:11px;"
                 f"font-family:'Consolas','Monaco',monospace;"
-                f"border:none;padding:0 2px;"
+                f"border:none;padding:0 1px;"
             )
             row_h.addWidget(lbl)
 
@@ -2891,7 +3070,8 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
             (c_hit, "#4ec9b0"),
             (c_miss, CursorTheme.ACCENT_ORANGE),
             (max(inp - c_hit - c_miss, 0), CursorTheme.ACCENT_PURPLE),
-            (out, CursorTheme.ACCENT_GREEN),
+            (reasoning, CursorTheme.ACCENT_YELLOW),
+            (max(out - reasoning, 0), CursorTheme.ACCENT_GREEN),
         ], max_total)
         row_h.addWidget(bar, 1)
 
