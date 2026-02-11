@@ -19,7 +19,7 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 - **多轮工具调用** — AI 自主决定调用哪些工具、以什么顺序执行
 - **Todo 任务系统** — 复杂任务自动拆分为子任务，实时跟踪状态
 - **流式输出** — 实时显示思考过程和回复内容
-- **深度思考** — 原生支持推理模型（DeepSeek-R1、GLM-Z1、Claude `<think>` 标签）
+- **深度思考** — 原生支持推理模型（DeepSeek-R1、GLM-4.7、Claude `<think>` 标签）
 - **随时中断** — 可在任意时刻停止正在运行的 Agent 循环
 - **智能上下文管理** — 按轮次裁剪对话，永不截断用户/助手消息，仅压缩工具结果
 
@@ -28,18 +28,20 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 | 提供商 | 模型 | 说明 |
 |--------|------|------|
 | **DeepSeek** | `deepseek-chat`、`deepseek-reasoner` (R1) | 性价比高，响应快，支持 Function Calling 和推理 |
-| **智谱 GLM** | `glm-4-flash`（免费）、`glm-4-plus`、`glm-4.7`、`glm-z1-flash`、`glm-z1-air` | 国内访问稳定，`glm-4.7` 具备原生推理能力 |
-| **OpenAI** | `gpt-4o-mini`、`gpt-4o`、`gpt-4-turbo` | 能力强大，完整 Function Calling 支持 |
+| **智谱 GLM** | `glm-4.7` | 国内访问稳定，原生推理与工具调用 |
+| **OpenAI** | `gpt-5.2` | 能力强大，完整 Function Calling 支持 |
 | **Ollama**（本地） | `qwen2.5:14b`、任意本地模型 | 隐私优先，自动检测可用模型 |
-| **拼好饭**（中转） | `claude-opus-4-5-kiro`、`claude-sonnet-4-5` 等 | 通过中转接口访问 Claude 模型 |
+| **拼好饭**（中转） | `claude-sonnet-4-5`、`claude-opus-4-5-kiro`、`gemini-3-pro-image-preview` 等 | 通过中转接口访问 Claude 和 Gemini 模型 |
 
 ### 深色 UI
 
 - 极简深色主题
 - 思考过程、工具调用、执行结果均可折叠/展开
 - 内置 **Python Shell** 和 **系统 Shell** 组件，支持语法高亮
+- **可点击节点路径** — 回复中的 `/obj/geo1/box1` 等路径自动变为链接，点击即可跳转到对应节点
 - **节点上下文栏**：实时显示当前选中的 Houdini 节点
 - **Todo 列表**：显示在对话区域上方，带实时状态图标
+- **Token 分析** — 实时显示 Token 用量、推理 Token、Cache 命中率和按模型计费的费用估算（点击查看详细分析面板）
 - 多会话标签页 — 同时运行多个独立对话
 - AI 回复一键复制
 - `Ctrl+Enter` 发送消息
@@ -56,7 +58,7 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 | `connect_nodes` | 连接两个节点（支持指定输入端口） |
 | `delete_node` | 删除节点 |
 | `copy_node` | 复制/克隆节点到同一或其他网络 |
-| `set_node_parameter` | 设置单个参数值 |
+| `set_node_parameter` | 设置单个参数值（智能纠错 — 参数不存在时自动提示相似参数名） |
 | `batch_set_parameters` | 批量设置多个节点的同一参数 |
 | `set_display_flag` | 设置节点的显示/渲染标志 |
 | `save_hip` | 保存当前 HIP 文件 |
@@ -75,7 +77,7 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 | `find_nodes_by_param` | 按参数值搜索节点（类似 `grep`） |
 | `get_node_inputs` | 获取节点输入端口信息（210+ 常用节点已预缓存） |
 | `check_errors` | 检查 Houdini 节点 cooking 错误和警告 |
-| `verify_and_summarize` | 验证网络完整性并生成总结报告 |
+| `verify_and_summarize` | 验证网络完整性并生成总结报告（已内置 `get_network_structure`，无需提前单独调用） |
 
 ### 代码执行
 
@@ -129,7 +131,7 @@ Houdini-Agent/
 ├── launcher.py                      # 启动器（自动检测 Houdini）
 ├── README.md                        # 英文文档
 ├── README_CN.md                     # 中文文档
-├── lib/                             # 内置依赖库（requests、urllib3、certifi 等）
+├── lib/                             # 内置依赖库（requests、urllib3、certifi、tiktoken 等）
 ├── config/                          # 运行时配置（自动创建，已 gitignore）
 │   └── houdini_ai.ini              # API Key 及设置
 ├── cache/                           # 对话缓存、文档索引、HIP 预览
@@ -153,7 +155,7 @@ Houdini-Agent/
     │   └── asset_checker.py        # 资产验证检查器
     ├── ui/
     │   ├── ai_tab.py              # AI Agent 标签页（主 UI、Agent 循环、上下文管理）
-    │   ├── cursor_widgets.py      # UI 组件（主题、对话块、Todo、Shell）
+    │   ├── cursor_widgets.py      # UI 组件（主题、对话块、Todo、Shell、Token 分析面板）
     │   ├── chat_window.py         # 旧版对话窗口
     │   ├── widgets.py             # 自定义 Qt 控件
     │   └── dialogs.py            # 对话框
@@ -170,7 +172,7 @@ Houdini-Agent/
     └── utils/
         ├── ai_client.py           # AI API 客户端（流式传输、Function Calling、联网搜索）
         ├── doc_rag.py             # 本地文档索引（节点/VEX/HOM O(1) 查找）
-        ├── token_optimizer.py     # Token 预算与压缩策略
+        ├── token_optimizer.py     # Token 预算与压缩策略（tiktoken 精准计数）
         ├── ultra_optimizer.py     # 系统提示词与工具定义优化器
         ├── hip_utils.py           # HIP 文件工具
         ├── training_data_exporter.py # 对话导出为训练数据 JSONL
@@ -263,12 +265,26 @@ launcher.show_tool()
 - **按轮次裁剪**：对话按用户消息分割为轮次；超出 Token 预算时，先压缩旧轮次的工具结果，再整轮删除最早的轮次
 - **永不截断 user/assistant**：仅压缩或移除 `tool` 结果内容
 - **自动 RAG 注入**：根据用户查询自动检索相关的节点/VEX/HOM 文档
+- **重复调用去重**：同一轮 Agent 循环中，相同参数的查询类工具调用会自动去重，节省 Token
 
 ### 线程安全
 
 - Houdini 节点操作 **必须** 在 Qt 主线程运行 — 通过 `BlockingQueuedConnection` 分发
 - 非 Houdini 工具（Shell、联网搜索、文档查询）在 **后台线程** 直接运行，保持 UI 响应
 - 所有 UI 更新通过 Qt 信号实现线程安全的跨线程通信
+
+### Token 计数与费用估算
+
+- **tiktoken 集成** — 可用时使用 tiktoken 精准计数，否则使用改良估算
+- **按模型计费** — 根据各提供商公布的定价（输入/输出/缓存费率）估算费用
+- **推理 Token 追踪** — 单独统计推理/思考 Token（DeepSeek-R1、GLM-4.7 等）
+- **Token 分析面板** — 每次请求的详细分解：输入、输出、推理、缓存、延迟和费用
+
+### 智能错误恢复
+
+- **参数纠错提示**：`set_node_parameter` 失败时，错误信息会列出相似的参数名或全部可用参数，帮助 AI 自我纠正
+- **文档查阅建议**：节点创建或参数设置失败时，建议先查询文档（`search_node_types`、`get_houdini_node_doc`、`get_node_parameters`）再重试
+- **连接重试**：网络瞬态错误（分块解码失败、连接中断等）自动指数退避重试
 
 ### 本地文档索引
 
@@ -333,7 +349,7 @@ Agent：[create_wrangle_node: vex_code="@Cd = set(rand(@ptnum), rand(@ptnum*13.3
 
 ### Agent 不调用工具
 - 确认所选提供商支持 Function Calling
-- DeepSeek、GLM-4、OpenAI、拼好饭（Claude）均支持工具调用
+- DeepSeek、GLM-4.7、OpenAI、拼好饭（Claude）均支持工具调用
 - Ollama 需要支持工具调用的模型（如 `qwen2.5`）
 
 ### 节点操作失败
@@ -347,6 +363,7 @@ Agent：[create_wrangle_node: vex_code="@Cd = set(rand(@ptnum), rand(@ptnum*13.3
 
 ## 版本历史
 
+- **v6.1** — 可点击节点路径、Token 费用追踪（tiktoken + 按模型计费）、Token 分析面板、参数智能纠错提示、`verify_and_summarize` 优化（内置网络检查）、重复调用去重、文档查阅建议、连接指数退避重试、模型默认值更新（GLM-4.7、GPT-5.2、Gemini-3-Pro）
 - **v6.0** — **Houdini Agent**：原生工具链、按轮次上下文裁剪、合并 `get_node_details` 到 `get_node_parameters`、Skill 系统（8 个分析脚本）、`execute_shell` 工具、本地文档 RAG、拼好饭/Ollama 提供商、多会话标签页、线程安全工具分发、连接重试逻辑
 - **v5.0** — 深色 UI 大更新：深色主题、可折叠区块、停止按钮、自动上下文压缩、代码高亮
 - **v4.0** — Agent 模式：多轮工具调用、GLM-4 支持

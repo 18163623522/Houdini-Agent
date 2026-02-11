@@ -19,7 +19,7 @@ User request → AI plans → call tools → inspect results → call more tools
 - **Multi-turn tool calling** — the AI decides which tools to call and in what order
 - **Todo task system** — complex tasks are broken into tracked subtasks with live status updates
 - **Streaming output** — real-time display of thinking process and responses
-- **Extended Thinking** — native support for reasoning models (DeepSeek-R1, GLM-Z1, Claude with `<think>` tags)
+- **Extended Thinking** — native support for reasoning models (DeepSeek-R1, GLM-4.7, Claude with `<think>` tags)
 - **Stop anytime** — interrupt the running agent loop at any point
 - **Smart context management** — round-based conversation trimming that never truncates user/assistant messages, only compresses tool results
 
@@ -28,18 +28,20 @@ User request → AI plans → call tools → inspect results → call more tools
 | Provider | Models | Notes |
 |----------|--------|-------|
 | **DeepSeek** | `deepseek-chat`, `deepseek-reasoner` (R1) | Cost-effective, fast, supports Function Calling & reasoning |
-| **GLM (Zhipu AI)** | `glm-4-flash` (free), `glm-4-plus`, `glm-4.7`, `glm-z1-flash`, `glm-z1-air` | Stable in China, `glm-4.7` has native reasoning |
-| **OpenAI** | `gpt-4o-mini`, `gpt-4o`, `gpt-4-turbo` | Powerful, full Function Calling support |
+| **GLM (Zhipu AI)** | `glm-4.7` | Stable in China, native reasoning & tool calling |
+| **OpenAI** | `gpt-5.2` | Powerful, full Function Calling support |
 | **Ollama** (local) | `qwen2.5:14b`, any local model | Privacy-first, auto-detects available models |
-| **Duojie** (relay) | `claude-opus-4-5-kiro`, `claude-sonnet-4-5`, etc. | Access to Claude models via relay endpoint |
+| **Duojie** (relay) | `claude-sonnet-4-5`, `claude-opus-4-5-kiro`, `gemini-3-pro-image-preview`, etc. | Access to Claude & Gemini models via relay endpoint |
 
 ### Dark UI
 
 - Minimal dark theme
 - Collapsible blocks for thinking process, tool calls, and results
 - Dedicated **Python Shell** and **System Shell** widgets with syntax highlighting
+- **Clickable node paths** — paths like `/obj/geo1/box1` in AI responses become links that navigate to the node in Houdini
 - **Node context bar** showing the currently selected Houdini node
 - **Todo list** displayed above the chat area with live status icons
+- **Token analytics** — real-time token count, reasoning tokens, cache hit rate, and per-model cost estimates (click for detailed breakdown)
 - Multi-session tabs — run multiple independent conversations
 - Copy button on AI responses
 - `Ctrl+Enter` to send messages
@@ -56,7 +58,7 @@ User request → AI plans → call tools → inspect results → call more tools
 | `connect_nodes` | Connect two nodes (with input index control) |
 | `delete_node` | Delete a node by path |
 | `copy_node` | Copy/clone a node to the same or another network |
-| `set_node_parameter` | Set a single parameter value |
+| `set_node_parameter` | Set a single parameter value (with smart error hints — suggests similar parameter names on failure) |
 | `batch_set_parameters` | Set the same parameter across multiple nodes |
 | `set_display_flag` | Set display/render flags on a node |
 | `save_hip` | Save the current HIP file |
@@ -75,7 +77,7 @@ User request → AI plans → call tools → inspect results → call more tools
 | `find_nodes_by_param` | Search nodes by parameter value (like `grep`) |
 | `get_node_inputs` | Get input port info (210+ common nodes pre-cached) |
 | `check_errors` | Check Houdini node cooking errors and warnings |
-| `verify_and_summarize` | Validate the network and generate a summary report |
+| `verify_and_summarize` | Validate the network and generate a summary report (includes `get_network_structure` — no need to call separately) |
 
 ### Code Execution
 
@@ -128,7 +130,8 @@ Skills are pre-optimized Python scripts that run inside the Houdini environment 
 Houdini-Agent/
 ├── launcher.py                      # Entry point (auto-detects Houdini)
 ├── README.md
-├── lib/                             # Bundled dependencies (requests, urllib3, certifi, …)
+├── README_CN.md
+├── lib/                             # Bundled dependencies (requests, urllib3, certifi, tiktoken, …)
 ├── config/                          # Runtime config (auto-created, gitignored)
 │   └── houdini_ai.ini              # API keys & settings
 ├── cache/                           # Conversation cache, doc index, HIP previews
@@ -152,7 +155,7 @@ Houdini-Agent/
     │   └── asset_checker.py        # Asset validation checker
     ├── ui/
     │   ├── ai_tab.py              # AI Agent tab (main UI, agent loop, context management)
-    │   ├── cursor_widgets.py      # UI widgets (theme, chat blocks, todo, shells)
+    │   ├── cursor_widgets.py      # UI widgets (theme, chat blocks, todo, shells, token analytics)
     │   ├── chat_window.py         # Legacy chat window
     │   ├── widgets.py             # Custom Qt widgets
     │   └── dialogs.py            # Dialog boxes
@@ -169,7 +172,7 @@ Houdini-Agent/
     └── utils/
         ├── ai_client.py           # AI API client (streaming, Function Calling, web search)
         ├── doc_rag.py             # Local doc index (nodes/VEX/HOM O(1) lookup)
-        ├── token_optimizer.py     # Token budget & compression strategies
+        ├── token_optimizer.py     # Token budget & compression (tiktoken-powered)
         ├── ultra_optimizer.py     # System prompt & tool definition optimizer
         ├── hip_utils.py           # HIP file utilities
         ├── training_data_exporter.py # Export conversations as training JSONL
@@ -262,12 +265,26 @@ Click the "Set API Key…" button and check "Save to local config".
 - **Round-based trimming**: Conversations are split into rounds (by user messages); when token budget is exceeded, older rounds' tool results are compressed first, then entire rounds are removed
 - **Never truncate user/assistant**: Only `tool` result content is compressed or removed
 - **Automatic RAG injection**: Relevant node/VEX/HOM documentation is automatically retrieved based on the user's query
+- **Duplicate call dedup**: Identical query-tool calls within the same agent turn are deduplicated to save tokens
 
 ### Thread Safety
 
 - Houdini node operations **must** run on the Qt main thread — dispatched via `BlockingQueuedConnection`
 - Non-Houdini tools (shell, web search, doc lookup) run directly in the **background thread** to keep the UI responsive
 - All UI updates use Qt signals for thread-safe cross-thread communication
+
+### Token Counting & Cost Estimation
+
+- **tiktoken integration** — accurate token counting when available, with improved fallback estimation
+- **Per-model pricing** — estimated costs based on each provider's published pricing (input/output/cache rates)
+- **Reasoning token tracking** — separate count for reasoning/thinking tokens (DeepSeek-R1, GLM-4.7, etc.)
+- **Token Analytics Panel** — detailed breakdown per request: input, output, reasoning, cache, latency, and cost
+
+### Smart Error Recovery
+
+- **Parameter hints**: When `set_node_parameter` fails, the error message includes similar parameter names or a list of available parameters to help the AI self-correct
+- **Doc-check suggestions**: When node creation or parameter setting fails, the error suggests querying documentation (`search_node_types`, `get_houdini_node_doc`, `get_node_parameters`) before retrying blindly
+- **Connection retry**: Transient network errors (chunk decoding, connection drops) are automatically retried with exponential backoff
 
 ### Local Documentation Index
 
@@ -286,7 +303,7 @@ Relevant docs are automatically injected into the system prompt based on the use
 ```
 User: Create a box, scatter 500 points on it, and copy small spheres to the points.
 Agent: [add_todo: plan 4 steps]
-       [create_wrangle_node or create_nodes_batch: box → scatter → sphere → copytopoints]
+       [create_nodes_batch: box → scatter → sphere → copytopoints]
        [set_node_parameter: scatter npts=500, sphere radius=0.05]
        [connect_nodes: ...]
        [verify_and_summarize]
@@ -332,7 +349,7 @@ Created attribwrangle1 with random Cd attribute on all points.
 
 ### Agent Not Calling Tools
 - Ensure the selected provider supports Function Calling
-- DeepSeek, GLM-4, OpenAI, and Duojie (Claude) all support tool calling
+- DeepSeek, GLM-4.7, OpenAI, and Duojie (Claude) all support tool calling
 - Ollama requires models with tool-calling support (e.g. `qwen2.5`)
 
 ### Node Operations Fail
@@ -346,6 +363,7 @@ Created attribwrangle1 with random Cd attribute on all points.
 
 ## Version History
 
+- **v6.1** — Clickable node paths, token cost tracking (tiktoken + per-model pricing), Token Analytics Panel, smart parameter error hints, streamlined `verify_and_summarize` (built-in network check), duplicate call dedup, doc-check error suggestions, connection retry with backoff, updated model defaults (GLM-4.7, GPT-5.2, Gemini-3-Pro)
 - **v6.0** — **Houdini Agent**: Native tool chain, round-based context trimming, merged `get_node_details` into `get_node_parameters`, Skills system (8 analysis scripts), `execute_shell` tool, local doc RAG, Duojie/Ollama providers, multi-session tabs, thread-safe tool dispatch, connection retry logic
 - **v5.0** — Dark UI overhaul: dark theme, collapsible blocks, stop button, auto context compression, code highlighting
 - **v4.0** — Agent mode: multi-turn tool calling, GLM-4 support
