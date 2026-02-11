@@ -29,9 +29,18 @@ User request → AI plans → call tools → inspect results → call more tools
 |----------|--------|-------|
 | **DeepSeek** | `deepseek-chat`, `deepseek-reasoner` (R1) | Cost-effective, fast, supports Function Calling & reasoning |
 | **GLM (Zhipu AI)** | `glm-4.7` | Stable in China, native reasoning & tool calling |
-| **OpenAI** | `gpt-5.2` | Powerful, full Function Calling support |
+| **OpenAI** | `gpt-5.2`, `gpt-5.3-codex` | Powerful, full Function Calling & Vision support |
 | **Ollama** (local) | `qwen2.5:14b`, any local model | Privacy-first, auto-detects available models |
-| **Duojie** (relay) | `claude-sonnet-4-5`, `claude-opus-4-5-kiro`, `gemini-3-pro-image-preview`, etc. | Access to Claude & Gemini models via relay endpoint |
+| **Duojie** (relay) | `claude-sonnet-4-5`, `claude-opus-4-6-kiro`, `gemini-3-pro-image-preview`, etc. | Access to Claude & Gemini models via relay endpoint |
+
+### Vision / Image Input
+
+- **Multimodal messages** — attach images (PNG/JPG/GIF/WebP) to your messages for vision-capable models
+- **Paste & drag-drop** — `Ctrl+V` paste from clipboard, drag image files into the chat input
+- **File picker** — click the "Img" button to select images from disk
+- **Image preview** — thumbnails displayed above the input box before sending, with remove buttons
+- **Model-aware** — automatically checks if the current model supports vision; non-vision models show a clear warning
+- Supported: OpenAI GPT-5.2/5.3, Claude (all variants), Gemini
 
 ### Dark UI
 
@@ -357,6 +366,7 @@ Created attribwrangle1 with random Cd attribute on all points.
 
 ## Version History
 
+- **v6.2** — **Vision/Image input**: multimodal messages with paste/drag-drop/file-picker, image preview with thumbnails, model-aware vision check. **Wrangle run_over guidance** in system prompt (prevents wrong VEX execution context). **Duojie reasoningEffort** mode (replaces model-name mapping with `reasoningEffort` parameter). **New models**: `gpt-5.3-codex`, `claude-opus-4-6-normal`, `claude-opus-4-6-kiro`. **Proxy tool_call fix**: robust splitting of concatenated `{...}{...}` arguments from relay services. **Legacy module cleanup** on startup.
 - **v6.1** — Clickable node paths, token cost tracking (tiktoken + per-model pricing), Token Analytics Panel, smart parameter error hints, streamlined `verify_and_summarize` (built-in network check), duplicate call dedup, doc-check error suggestions, connection retry with backoff, updated model defaults (GLM-4.7, GPT-5.2, Gemini-3-Pro)
 - **v6.0** — **Houdini Agent**: Native tool chain, round-based context trimming, merged `get_node_details` into `get_node_parameters`, Skills system (8 analysis scripts), `execute_shell` tool, local doc RAG, Duojie/Ollama providers, multi-session tabs, thread-safe tool dispatch, connection retry logic
 - **v5.0** — Dark UI overhaul: dark theme, collapsible blocks, stop button, auto context compression, code highlighting

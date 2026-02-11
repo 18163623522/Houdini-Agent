@@ -29,9 +29,18 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 |--------|------|------|
 | **DeepSeek** | `deepseek-chat`、`deepseek-reasoner` (R1) | 性价比高，响应快，支持 Function Calling 和推理 |
 | **智谱 GLM** | `glm-4.7` | 国内访问稳定，原生推理与工具调用 |
-| **OpenAI** | `gpt-5.2` | 能力强大，完整 Function Calling 支持 |
+| **OpenAI** | `gpt-5.2`、`gpt-5.3-codex` | 能力强大，完整 Function Calling 与 Vision 支持 |
 | **Ollama**（本地） | `qwen2.5:14b`、任意本地模型 | 隐私优先，自动检测可用模型 |
-| **拼好饭**（中转） | `claude-sonnet-4-5`、`claude-opus-4-5-kiro`、`gemini-3-pro-image-preview` 等 | 通过中转接口访问 Claude 和 Gemini 模型 |
+| **拼好饭**（中转） | `claude-sonnet-4-5`、`claude-opus-4-6-kiro`、`gemini-3-pro-image-preview` 等 | 通过中转接口访问 Claude 和 Gemini 模型 |
+
+### 图片/多模态输入
+
+- **多模态消息** — 为支持视觉的模型附加图片（PNG/JPG/GIF/WebP）
+- **粘贴与拖拽** — `Ctrl+V` 从剪贴板粘贴图片，或直接拖拽图片文件到输入框
+- **文件选择器** — 点击「Img」按钮从磁盘选择图片
+- **图片预览** — 发送前在输入框上方显示缩略图，支持单独移除
+- **模型感知** — 自动检测当前模型是否支持视觉；不支持的模型会给出明确提示
+- 已支持：OpenAI GPT-5.2/5.3、Claude（所有变体）、Gemini
 
 ### 深色 UI
 
@@ -357,6 +366,7 @@ Agent：[create_wrangle_node: vex_code="@Cd = set(rand(@ptnum), rand(@ptnum*13.3
 
 ## 版本历史
 
+- **v6.2** — **图片/多模态输入**：支持粘贴/拖拽/文件选择器附加图片，发送前缩略图预览，模型视觉能力自动检测。**Wrangle run_over 指导**：系统提示词新增 VEX 执行上下文选择规则（防止错误的 run_over 模式）。**Duojie reasoningEffort 模式**（用 `reasoningEffort` 参数替代模型名映射）。**新增模型**：`gpt-5.3-codex`、`claude-opus-4-6-normal`、`claude-opus-4-6-kiro`。**代理 tool_call 修复**：健壮拆分中转服务拼接的 `{...}{...}` arguments。**旧模块清理**：启动时自动清理 `HOUDINI_HIP_MANAGER` 残留模块。
 - **v6.1** — 可点击节点路径、Token 费用追踪（tiktoken + 按模型计费）、Token 分析面板、参数智能纠错提示、`verify_and_summarize` 优化（内置网络检查）、重复调用去重、文档查阅建议、连接指数退避重试、模型默认值更新（GLM-4.7、GPT-5.2、Gemini-3-Pro）
 - **v6.0** — **Houdini Agent**：原生工具链、按轮次上下文裁剪、合并 `get_node_details` 到 `get_node_parameters`、Skill 系统（8 个分析脚本）、`execute_shell` 工具、本地文档 RAG、拼好饭/Ollama 提供商、多会话标签页、线程安全工具分发、连接重试逻辑
 - **v5.0** — 深色 UI 大更新：深色主题、可折叠区块、停止按钮、自动上下文压缩、代码高亮
