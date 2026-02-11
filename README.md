@@ -1,324 +1,360 @@
-# Houdini AI Assistant
+# Houdini Agent
 
-Houdini AI 助手，提供智能节点操作、联网搜索、Python 代码执行等功能。
+An AI-powered assistant for SideFX Houdini, featuring autonomous multi-turn tool calling, web search, VEX/Python code execution, and a Cursor-style dark UI.
 
-Cursor 风格的极简 UI，专注于 AI 交互。
+Built on the **OpenAI Function Calling** protocol, the agent can read node networks, create/modify/connect nodes, run VEX wrangles, execute system shell commands, search the web, and query local documentation — all within an iterative agent loop.
 
-## 🌟 核心特性
+## Core Features
 
-### AI Agent 模式（Cursor 风格 UI）
+### Agent Loop (Cursor-style)
 
-全新的 **Cursor 风格深色主题界面**：
-
-- 🎨 **深色主题**：与 Cursor/VS Code 一致的深色 UI
-- 📦 **可折叠区块**：思考过程、工具调用、结果都可展开/折叠
-- ⏹️ **真正的停止功能**：可随时中断正在进行的 AI 请求
-- 💬 **上下文管理**：自动压缩长对话，保持上下文连贯性
-- 🔄 **流式输出**：实时显示 AI 思考和回复过程
-- ⌨️ **快捷键支持**：Ctrl+Enter 发送消息
-
-### 智能节点操作
-
-- **多轮工具调用**：AI 可以自主决定读取节点、分析网络、修改参数
-- **智能节点操作**：先读取网络结构，再获取详细参数，然后执行操作
-- **Function Calling**：使用 OpenAI 兼容的工具调用协议
-
-### 支持的 AI 提供商
-| 提供商 | 模型 | 特点 |
-|--------|------|------|
-| **DeepSeek**（推荐） | deepseek-chat, deepseek-coder | 性价比高，响应快 |
-| **智谱GLM** | glm-4.6v-flash（免费）, glm-4-flash, glm-4-plus, glm-4-air | 国内访问稳定 |
-| **OpenAI** | gpt-4o-mini, gpt-4o, gpt-4-turbo | 能力强大 |
-
-## 项目结构
+The AI operates in an autonomous **agent loop**: it receives a user request, plans the steps, calls tools, inspects results, and iterates until the task is complete.
 
 ```
-HOUDINI-ASSET-MANAGER/
-├── launcher.py                  # 启动器
-├── lib/                         # 内置依赖库（requests 等）
-│   ├── requests/
-│   ├── urllib3/
-│   ├── certifi/
-│   └── ...
-├── config/                      # 配置目录（自动创建）
-│   └── houdini_ai.ini          # AI 助手配置（API Key 等）
-├── cache/                       # 缓存目录（快照等）
-├── shared/                      # 共享模块
-│   ├── common_utils.py         # 路径/配置工具
-│   └── p4v_utils.py            # P4V 集成
-└── HOUDINI_HIP_MANAGER/        # Houdini 工具
-    ├── main.py                 # 入口
-    ├── core/                   # 核心逻辑
-    │   ├── hip_manager.py      # HIP 文件管理器
-    │   └── asset_checker.py    # 资产检查器
-    ├── ui/                     # UI 组件
-    │   ├── ai_tab.py          # AI Agent 助手（Cursor 风格）
-    │   ├── cursor_widgets.py  # Cursor 风格 UI 组件
-    │   ├── chat_window.py     # 对话窗口
-    │   ├── widgets.py         # 自定义控件
-    │   └── dialogs.py         # 对话框
-    └── utils/                  # 工具函数
-        ├── ai_client.py       # AI API 客户端（支持 Function Calling）
-        ├── hip_utils.py       # HIP 文件操作
-        └── mcp/               # 节点操作系统
-            ├── client.py      # 节点操作客户端（工具执行器）
-            └── ...
+User request → AI plans → call tools → inspect results → call more tools → … → final reply
 ```
 
-## 快速开始
+- **Multi-turn tool calling** — the AI decides which tools to call and in what order
+- **Todo task system** — complex tasks are broken into tracked subtasks with live status updates
+- **Streaming output** — real-time display of thinking process and responses
+- **Extended Thinking** — native support for reasoning models (DeepSeek-R1, GLM-Z1, Claude with `<think>` tags)
+- **Stop anytime** — interrupt the running agent loop at any point
+- **Cursor-style context management** — round-based conversation trimming that never truncates user/assistant messages, only compresses tool results
 
-### 环境要求
-- Windows
-- Python 3.9+
-- PySide6
-- Houdini 20.5+ / 21+
+### Supported AI Providers
 
-### 依赖库
+| Provider | Models | Notes |
+|----------|--------|-------|
+| **DeepSeek** | `deepseek-chat`, `deepseek-reasoner` (R1) | Cost-effective, fast, supports Function Calling & reasoning |
+| **GLM (Zhipu AI)** | `glm-4-flash` (free), `glm-4-plus`, `glm-4.7`, `glm-z1-flash`, `glm-z1-air` | Stable in China, `glm-4.7` has native reasoning |
+| **OpenAI** | `gpt-4o-mini`, `gpt-4o`, `gpt-4-turbo` | Powerful, full Function Calling support |
+| **Ollama** (local) | `qwen2.5:14b`, any local model | Privacy-first, auto-detects available models |
+| **Duojie** (relay) | `claude-opus-4-5-kiro`, `claude-sonnet-4-5`, etc. | Access to Claude models via relay endpoint |
 
-项目包含一个 `lib/` 目录，内置了以下依赖库，无需额外安装：
+### Cursor-style Dark UI
 
-- `requests` - HTTP 请求库
-- `urllib3` - URL 处理
-- `certifi` - SSL 证书
-- `charset_normalizer` - 字符编码检测
-- `idna` - 国际化域名
+- Dark theme consistent with Cursor/VS Code
+- Collapsible blocks for thinking process, tool calls, and results
+- Dedicated **Python Shell** and **System Shell** widgets with syntax highlighting
+- **Node context bar** showing the currently selected Houdini node
+- **Todo list** displayed above the chat area with live status icons
+- Multi-session tabs — run multiple independent conversations
+- Copy button on AI responses
+- `Ctrl+Enter` to send messages
 
-代码会自动从 `lib/` 目录加载这些库。
+## Available Tools (30+)
 
-### 在 Houdini 中使用
+### Node Operations
+
+| Tool | Description |
+|------|-------------|
+| `create_wrangle_node` | **Priority tool** — create a Wrangle node with VEX code (point/prim/vertex/volume/detail) |
+| `create_node` | Create a single node by type name |
+| `create_nodes_batch` | Batch-create nodes with automatic connections |
+| `connect_nodes` | Connect two nodes (with input index control) |
+| `delete_node` | Delete a node by path |
+| `copy_node` | Copy/clone a node to the same or another network |
+| `set_node_parameter` | Set a single parameter value |
+| `batch_set_parameters` | Set the same parameter across multiple nodes |
+| `set_display_flag` | Set display/render flags on a node |
+| `save_hip` | Save the current HIP file |
+| `undo_redo` | Undo or redo operations |
+
+### Query & Inspection
+
+| Tool | Description |
+|------|-------------|
+| `get_network_structure` | Get the full node network topology (names, types, connections, embedded VEX code) |
+| `get_node_parameters` | Get node parameters **plus** node status, flags, errors, inputs, and outputs (replaces old `get_node_details`) |
+| `list_children` | List child nodes with flags (like `ls`) |
+| `read_selection` | Read the currently selected node(s) in the viewport |
+| `search_node_types` | Keyword search for Houdini node types |
+| `semantic_search_nodes` | Natural-language search for node types (e.g. "scatter points on surface") |
+| `find_nodes_by_param` | Search nodes by parameter value (like `grep`) |
+| `get_node_inputs` | Get input port info (210+ common nodes pre-cached) |
+| `check_errors` | Check Houdini node cooking errors and warnings |
+| `verify_and_summarize` | Validate the network and generate a summary report |
+
+### Code Execution
+
+| Tool | Description |
+|------|-------------|
+| `execute_python` | Run Python code in the Houdini Python Shell (`hou` module available) |
+| `execute_shell` | Run system shell commands (pip, git, ssh, scp, ffmpeg, etc.) with timeout and safety checks |
+
+### Web & Documentation
+
+| Tool | Description |
+|------|-------------|
+| `web_search` | Search the web via Brave/DuckDuckGo (auto-fallback, cached) |
+| `fetch_webpage` | Fetch and extract webpage content (paginated, encoding-aware) |
+| `search_local_doc` | Search the local Houdini doc index (nodes, VEX functions, HOM classes) |
+| `get_houdini_node_doc` | Get detailed node documentation (local help server → SideFX online → node type info) |
+
+### Skills (Pre-built Analysis Scripts)
+
+| Tool | Description |
+|------|-------------|
+| `run_skill` | Execute a named skill with parameters |
+| `list_skills` | List all available skills |
+
+### Task Management
+
+| Tool | Description |
+|------|-------------|
+| `add_todo` | Add a task to the Todo list |
+| `update_todo` | Update task status (pending / in_progress / done / error) |
+
+## Skills System
+
+Skills are pre-optimized Python scripts that run inside the Houdini environment for reliable geometry analysis. They are preferred over hand-written `execute_python` for common tasks.
+
+| Skill | Description |
+|-------|-------------|
+| `analyze_geometry_attribs` | Attribute statistics (min/max/mean/std/NaN/Inf) for point/vertex/prim/detail |
+| `analyze_normals` | Normal quality detection — NaN, zero-length, non-normalized, flipped faces |
+| `get_bounding_info` | Bounding box, center, size, diagonal, volume, surface area, aspect ratio |
+| `analyze_connectivity` | Connected components analysis (piece count, point/prim per piece) |
+| `compare_attributes` | Diff attributes between two nodes (added/removed/type-changed) |
+| `find_dead_nodes` | Find orphan and unused end-of-chain nodes |
+| `trace_node_dependencies` | Trace upstream dependencies or downstream impacts |
+| `find_attribute_references` | Find all nodes referencing a given attribute (VEX code, expressions, string params) |
+
+## Project Structure
+
+```
+Houdini-Agent/
+├── launcher.py                      # Entry point (auto-detects Houdini)
+├── README.md
+├── lib/                             # Bundled dependencies (requests, urllib3, certifi, …)
+├── config/                          # Runtime config (auto-created, gitignored)
+│   └── houdini_ai.ini              # API keys & settings
+├── cache/                           # Conversation cache, doc index, HIP previews
+├── Doc/                             # Offline documentation
+│   ├── houdini_knowledge_base.txt  # Houdini programming knowledge base
+│   ├── vex_attributes_reference.txt
+│   ├── vex_snippets_reference.txt
+│   ├── nodes.zip                   # Node docs index (wiki markup)
+│   ├── vex.zip                     # VEX function docs index
+│   └── hom.zip                     # HOM class/method docs index
+├── shared/                          # Shared utilities
+│   ├── common_utils.py             # Path & config helpers
+│   └── p4v_utils.py               # Perforce integration
+├── trainData/                       # Exported training data (JSONL)
+└── HOUDINI_HIP_MANAGER/            # Main module
+    ├── main.py                     # Module entry
+    ├── shelf_tool.py               # Houdini shelf tool integration
+    ├── QUICK_SHELF_CODE.py         # Quick shelf code snippet
+    ├── core/
+    │   ├── hip_manager.py          # HIP file browser & manager
+    │   └── asset_checker.py        # Asset validation checker
+    ├── ui/
+    │   ├── ai_tab.py              # AI Agent tab (main UI, agent loop, context management)
+    │   ├── cursor_widgets.py      # Cursor-style widgets (theme, chat blocks, todo, shells)
+    │   ├── chat_window.py         # Legacy chat window
+    │   ├── widgets.py             # Custom Qt widgets
+    │   └── dialogs.py            # Dialog boxes
+    ├── skills/                     # Pre-built analysis scripts
+    │   ├── __init__.py            # Skill registry & loader
+    │   ├── analyze_normals.py     # Normal quality detection
+    │   ├── analyze_point_attrib.py # Geometry attribute statistics
+    │   ├── bounding_box_info.py   # Bounding box info
+    │   ├── compare_attributes.py  # Attribute diff between nodes
+    │   ├── connectivity_analysis.py # Connected components
+    │   ├── find_attrib_references.py # Attribute usage search
+    │   ├── find_dead_nodes.py     # Dead/orphan node finder
+    │   └── trace_dependencies.py  # Dependency tree tracer
+    └── utils/
+        ├── ai_client.py           # AI API client (streaming, Function Calling, web search)
+        ├── doc_rag.py             # Local doc index (nodes/VEX/HOM O(1) lookup)
+        ├── token_optimizer.py     # Token budget & compression strategies
+        ├── ultra_optimizer.py     # System prompt & tool definition optimizer
+        ├── hip_utils.py           # HIP file utilities
+        ├── training_data_exporter.py # Export conversations as training JSONL
+        └── mcp/                   # Houdini MCP (Model Context Protocol) layer
+            ├── client.py          # Tool executor (node ops, shell, skills dispatch)
+            ├── hou_core.py        # Low-level hou module wrappers
+            ├── node_inputs.json   # Pre-cached input port info (210+ nodes)
+            ├── server.py          # MCP server (reserved)
+            ├── settings.py        # MCP settings
+            └── logger.py          # Logging
+```
+
+## Quick Start
+
+### Requirements
+
+- **Houdini 20.5+** (or 21+)
+- **Python 3.9+** (bundled with Houdini)
+- **PySide6** (bundled with Houdini)
+- **Windows** (primary), Linux/macOS support possible
+
+### Installation
+
+No pip install needed — all dependencies are bundled in the `lib/` directory.
+
+1. Clone or download this repository
+2. Place it anywhere accessible from Houdini
+
+### Launch in Houdini
 
 ```python
 import sys
-sys.path.insert(0, r"C:\path\to\HOUDINI-ASSET-MANAGER")
+sys.path.insert(0, r"C:\path\to\Houdini-Agent")
 import launcher
 launcher.show_tool()
 ```
 
-### 配置 API Key
+Or add this to a **Shelf Tool** for one-click access.
 
-1. **环境变量（推荐）**
-   ```powershell
-   # DeepSeek
-   [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', '<你的Key>', 'User')
-   
-   # GLM-4.7（智谱AI）
-   [Environment]::SetEnvironmentVariable('GLM_API_KEY', '<你的Key>', 'User')
-   
-   # OpenAI
-   [Environment]::SetEnvironmentVariable('OPENAI_API_KEY', '<你的Key>', 'User')
-   ```
+### Configure API Keys
 
-2. **工具内设置**
-   - 点击"设置 API Key…"按钮
-   - 勾选"保存到本机配置"
+**Option A: Environment Variables (recommended)**
 
-## AI Agent 功能详解
+```powershell
+# DeepSeek
+[Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', 'sk-xxx', 'User')
 
-### 工作原理
+# GLM (Zhipu AI)
+[Environment]::SetEnvironmentVariable('GLM_API_KEY', 'xxx.xxx', 'User')
 
-AI Agent 模式实现了类似 Cursor 的多轮工具调用：
+# OpenAI
+[Environment]::SetEnvironmentVariable('OPENAI_API_KEY', 'sk-xxx', 'User')
 
-```
-用户请求 → AI 分析 → 调用工具 → 获取结果 → AI 继续分析 → 调用更多工具 → ... → 最终回复
+# Duojie (relay)
+[Environment]::SetEnvironmentVariable('DUOJIE_API_KEY', 'xxx', 'User')
 ```
 
-### 可用工具
+**Option B: In-app settings**
 
-| 工具 | 功能 |
-|------|------|
-| `get_network_structure` | 获取节点网络拓扑（节点名、类型、连接） |
-| `get_node_details` | 获取节点详细参数 |
-| `set_node_parameter` | 设置节点参数 |
-| `create_node` | 创建单个节点 |
-| `create_nodes_batch` | 批量创建节点网络 |
-| `connect_nodes` | 连接两个节点 |
-| `delete_node` | 删除节点 |
-| `search_node_types` | 搜索节点类型 |
-| `check_errors` | **检查节点/网络的错误和警告** |
-| `execute_python` | 在 Houdini Python 环境中执行代码 |
-| `web_search` | 联网搜索 Houdini 文档和信息 |
-| `fetch_webpage` | 获取网页内容 |
-| `add_todo` | 添加任务到 Todo 列表 |
-| `update_todo` | 更新任务状态 |
-| `verify_and_summarize` | 验证结果并生成总结 |
+Click the "Set API Key…" button and check "Save to local config".
 
-### Todo 任务系统
+## Architecture
 
-AI 会使用 **Todo 任务系统** 来规划和跟踪复杂任务：
+### Agent Loop Flow
 
 ```
-用户请求 → AI 创建 Todo 列表 → 逐个执行任务 → 更新状态 → 验证结果 → 生成总结
+┌─────────────────────────────────────────────────────────┐
+│  User sends message                                      │
+│  ↓                                                       │
+│  System prompt + conversation history + RAG docs         │
+│  ↓                                                       │
+│  AI model (streaming) → thinking + tool_calls            │
+│  ↓                                                       │
+│  Tool executor dispatches each tool:                     │
+│    - Houdini tools → main thread (Qt BlockingQueued)     │
+│    - Shell / web / doc → background thread (non-blocking)│
+│  ↓                                                       │
+│  Tool results → fed back to AI as tool messages          │
+│  ↓                                                       │
+│  AI continues (may call more tools or produce final text)│
+│  ↓                                                       │
+│  Loop until AI finishes or max iterations reached        │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**工作流程：**
+### Context Management (Cursor-style)
 
-1. **任务规划**：AI 使用 `add_todo` 创建任务清单
-2. **执行跟踪**：每完成一个步骤，AI 使用 `update_todo` 更新状态
-3. **结果验证**：完成所有任务后，AI 使用 `verify_and_summarize` 检查结果
-4. **自动修正**：如果结果不符合预期，AI 会自动返回修正
+- **Native tool message chain**: `assistant(tool_calls)` → `tool(result)` messages are passed directly to the model, preserving structured information
+- **Strict user/assistant alternation**: Ensures API compatibility across providers
+- **Round-based trimming**: Conversations are split into rounds (by user messages); when token budget is exceeded, older rounds' tool results are compressed first, then entire rounds are removed
+- **Never truncate user/assistant**: Only `tool` result content is compressed or removed
+- **Automatic RAG injection**: Relevant node/VEX/HOM documentation is automatically retrieved based on the user's query
 
-**UI 显示：**
+### Thread Safety
 
-- Todo 列表显示在对话区域上方
-- 不同状态有不同图标：○ 待处理 / ◎ 进行中 / ● 已完成 / ✗ 错误
-- 可以清空或折叠 Todo 列表
+- Houdini node operations **must** run on the Qt main thread — dispatched via `BlockingQueuedConnection`
+- Non-Houdini tools (shell, web search, doc lookup) run directly in the **background thread** to keep the UI responsive
+- All UI updates use Qt signals for thread-safe cross-thread communication
 
-### 错误检查与自动修复
+### Local Documentation Index
 
-AI 会**自动检查节点错误和警告**，并尝试修复：
+The `doc_rag.py` module provides O(1) lookup from bundled ZIP archives:
 
-1. **创建后检查**：每次创建节点后，AI 会调用 `check_errors` 检查是否有报错
-2. **自动分析**：根据错误信息分析问题原因（缺少输入、参数错误等）
-3. **主动修复**：通过调整参数、修改连接或更换节点类型来修复问题
-4. **验证修复**：修复后再次检查，确保问题已解决
+- **nodes.zip** — Node documentation (type, description, parameters) for all SOP/OBJ/DOP/VOP/COP nodes
+- **vex.zip** — VEX function signatures and descriptions
+- **hom.zip** — HOM (Houdini Object Model) class and method docs
+- **Doc/*.txt** — Knowledge base articles on Houdini programming
 
-这模拟了真实 Houdini 用户的工作流程：创建节点 → 检查错误 → 修复 → 验证。
+Relevant docs are automatically injected into the system prompt based on the user's query.
 
-### 减少幻觉机制
+## Usage Examples
 
-AI 被设计为**主动使用联网搜索**来获取真实的节点信息：
-
-1. **参数名验证**：设置参数前，AI 会搜索官方文档确认正确的参数名
-2. **不依赖记忆**：AI 不会凭空猜测参数名，而是通过搜索确认
-3. **使用最新文档**：**仅使用 Houdini 21 官方文档**（https://www.sidefx.com/docs/houdini/）
-
-### Houdini 21 文档规则
-
-AI 搜索 Houdini 信息时会：
-- 使用 `site:sidefx.com Houdini 21` 限定搜索范围
-- 直接访问官方节点文档：`https://www.sidefx.com/docs/houdini/nodes/sop/节点名.html`
-- 避免使用过时的 Houdini 18/19/20 文档
-
-### 使用示例
-
-**示例 1：查看网络结构**
+**Create a scatter setup:**
 ```
-用户：帮我看看当前网络有哪些节点
-AI：[调用 get_network_structure]
-AI：当前网络包含 5 个节点：box1, scatter1, copytopoints1...
+User: Create a box, scatter 500 points on it, and copy small spheres to the points.
+Agent: [add_todo: plan 4 steps]
+       [create_wrangle_node or create_nodes_batch: box → scatter → sphere → copytopoints]
+       [set_node_parameter: scatter npts=500, sphere radius=0.05]
+       [connect_nodes: ...]
+       [verify_and_summarize]
+Done. Created box1 → scatter1 → copytopoints1 with a sphere template. 500 points, radius 0.05.
 ```
 
-**示例 2：创建节点网络**
+**Analyze geometry attributes:**
 ```
-用户：创建一个 box，在上面 scatter 100 个点
-AI：[调用 create_node: box]
-AI：[调用 create_node: scatter]
-AI：[调用 connect_nodes: box → scatter]
-AI：[调用 set_node_parameter: scatter.npts = 100]
-AI：已完成！创建了 box1 和 scatter1，scatter 点数设置为 100
+User: What attributes does /obj/geo1/OUT have?
+Agent: [run_skill: analyze_geometry_attribs, node_path=/obj/geo1/OUT]
+The node has 5 point attributes: P(vector3), N(vector3), Cd(vector3), pscale(float), id(int). ...
 ```
 
-**示例 3：修改节点参数（带联网验证）**
+**Search and apply from documentation:**
 ```
-用户：把 box1 的大小改成 5
-AI：[调用 web_search: "Houdini box node size parameter"]
-AI：[调用 get_node_details: /obj/geo1/box1]
-AI：[调用 set_node_parameter: size=(5,5,5)]
-AI：已将 box1 的尺寸修改为 5x5x5
-```
-
-**示例 4：执行 Python 代码**
-```
-用户：用 Python 给所有点添加随机颜色
-AI：[调用 execute_python: ...]
-AI：已执行代码，为 1000 个点添加了随机 Cd 属性
+User: How do I use the heightfield noise node?
+Agent: [search_local_doc: heightfield noise]
+       [get_houdini_node_doc: heightfield_noise]
+       [web_search: "SideFX Houdini heightfield noise parameters"]
+Based on the documentation, heightfield_noise requires a HeightField input. ...
 ```
 
-**示例 5：自动检查和修复错误**
+**Execute shell commands:**
 ```
-用户：创建一个山地地形
-AI：[调用 create_node: grid, heightfield_noise]
-AI：[调用 connect_nodes: ...]
-AI：[调用 check_errors]  ← 自动检查节点错误
-AI：检测到错误：heightfield_noise 需要 HeightField 输入
-AI：[调用 delete_node: heightfield_noise]
-AI：[调用 web_search: "Houdini heightfield from polygon"]
-AI：[调用 create_node: heightfield_project]
-AI：[调用 check_errors]  ← 再次验证
-AI：✅ 没有错误，已成功创建山地地形
+User: Install numpy for Houdini's Python.
+Agent: [execute_shell: "C:/Program Files/Side Effects Software/Houdini 21.0/bin/hython.exe" -m pip install numpy]
+Successfully installed numpy-1.26.4.
 ```
 
-**示例 5：搜索 VEX 知识**
+**Run VEX code:**
 ```
-用户：VEX 怎么写随机颜色？
-AI：[调用 web_search: "Houdini VEX random color attribute"]
-AI：[调用 fetch_webpage: sidefx.com/docs/...]
-AI：根据官方文档，你可以这样写：@Cd = set(rand(@ptnum), ...)
+User: Add random colors to all points.
+Agent: [create_wrangle_node: vex_code="@Cd = set(rand(@ptnum), rand(@ptnum*13.37), rand(@ptnum*7.13));"]
+Created attribwrangle1 with random Cd attribute on all points.
 ```
 
-### Agent 模式 vs 普通模式
+## Troubleshooting
 
-| 特性 | Agent 模式 | 普通模式 |
-|------|-----------|---------|
-| 自动读取节点 | ✅ | ❌ |
-| 多轮工具调用 | ✅ | ❌ |
-| 自主决策 | ✅ | ❌ |
-| 响应速度 | 较慢（多次调用） | 快 |
+### API Connection Issues
+- Use the "Test Connection" button to diagnose
+- Check that your API key is correct
+- Verify network access to the API endpoint
 
-## HIP 文件管理
+### Agent Not Calling Tools
+- Ensure the selected provider supports Function Calling
+- DeepSeek, GLM-4, OpenAI, and Duojie (Claude) all support tool calling
+- Ollama requires models with tool-calling support (e.g. `qwen2.5`)
 
-- 浏览、打开、保存 HIP 文件
-- 快照预览
-- 搜索和排序
-- 删除和批量删除
+### Node Operations Fail
+- Confirm you are running inside Houdini (not standalone Python)
+- Check that node paths are absolute (e.g. `/obj/geo1/box1`)
+- Review the tool execution result for specific error messages
 
-## 资产检查
+### UI Freezing
+- Non-Houdini tools (shell, web) should run in the background thread
+- If the UI freezes during shell commands, update to the latest version
 
-- 节点参数检查
-- 配置允许的属性
-- 导出资产
+## Version History
 
-## GLM-4.7 API 说明
+- **v6.0** — **Houdini Agent**: Cursor-style native tool chain, round-based context trimming, merged `get_node_details` into `get_node_parameters`, Skills system (8 analysis scripts), `execute_shell` tool, local doc RAG, Duojie/Ollama providers, multi-session tabs, thread-safe tool dispatch, connection retry logic
+- **v5.0** — Cursor-style UI: dark theme, collapsible blocks, stop button, auto context compression, code highlighting
+- **v4.0** — Agent mode: multi-turn tool calling, GLM-4 support
+- **v3.0** — Houdini-only tool (removed other DCC support)
+- **v2.0** — Multi-DCC architecture
+- **v1.0** — Initial release
 
-GLM-4.7 是智谱AI 提供的大语言模型，API 格式与 OpenAI 兼容。
-
-**API 端点**：`https://open.bigmodel.cn/api/paas/v4/chat/completions`
-
-**获取 API Key**：
-1. 访问 [智谱AI开放平台](https://open.bigmodel.cn/)
-2. 注册账号并创建 API Key
-3. 在工具中配置或设置环境变量 `GLM_API_KEY`
-
-**可用模型**：
-- `glm-4.6v-flash`：🆓 免费多模态模型（支持图片/视频/文件，支持 Function Call）
-- `glm-4-flash`：快速版（性价比高）
-- `glm-4-plus`：最强模型
-- `glm-4-air`：平衡版
-- `glm-4-long`：长文本版（支持 1M 上下文）
-
-## 疑难排查
-
-### API 连接问题
-- 使用"测试连接"按钮诊断
-- 检查 API Key 是否正确
-- 确认网络可访问 API 端点
-
-### Agent 模式不工作
-- 确认 AI 提供商支持 Function Calling
-- DeepSeek 和 GLM-4.7 都支持工具调用
-
-### 节点操作失败
-- 确认在 Houdini 中运行
-- 检查节点路径是否正确
-- 查看工具执行结果中的错误信息
-
-## 版本历史
-
-- **v5.0** — **Cursor 风格 UI 大更新**
-  - 深色主题界面
-  - 可折叠的思考过程和工具调用
-  - 真正的停止功能（中断请求）
-  - 上下文自动压缩
-  - 代码块语法高亮
-- v4.0 — Agent 模式，支持多轮工具调用，添加 GLM-4.7
-- v3.0 — 精简为纯 Houdini 工具
-- v2.0 — 多 DCC 支持架构
-- v1.0 — 初始版本
-
-## 作者
+## Author
 
 KazamaSuichiku
 
-## 许可证
+## License
 
-内部工具，仅供项目使用
+MIT
