@@ -1,12 +1,12 @@
 # Houdini Agent
 
-An AI-powered assistant for SideFX Houdini, featuring autonomous multi-turn tool calling, web search, VEX/Python code execution, and a Cursor-style dark UI.
+An AI-powered assistant for SideFX Houdini, featuring autonomous multi-turn tool calling, web search, VEX/Python code execution, and a minimal dark UI.
 
 Built on the **OpenAI Function Calling** protocol, the agent can read node networks, create/modify/connect nodes, run VEX wrangles, execute system shell commands, search the web, and query local documentation — all within an iterative agent loop.
 
 ## Core Features
 
-### Agent Loop (Cursor-style)
+### Agent Loop
 
 The AI operates in an autonomous **agent loop**: it receives a user request, plans the steps, calls tools, inspects results, and iterates until the task is complete.
 
@@ -19,7 +19,7 @@ User request → AI plans → call tools → inspect results → call more tools
 - **Streaming output** — real-time display of thinking process and responses
 - **Extended Thinking** — native support for reasoning models (DeepSeek-R1, GLM-Z1, Claude with `<think>` tags)
 - **Stop anytime** — interrupt the running agent loop at any point
-- **Cursor-style context management** — round-based conversation trimming that never truncates user/assistant messages, only compresses tool results
+- **Smart context management** — round-based conversation trimming that never truncates user/assistant messages, only compresses tool results
 
 ### Supported AI Providers
 
@@ -31,9 +31,9 @@ User request → AI plans → call tools → inspect results → call more tools
 | **Ollama** (local) | `qwen2.5:14b`, any local model | Privacy-first, auto-detects available models |
 | **Duojie** (relay) | `claude-opus-4-5-kiro`, `claude-sonnet-4-5`, etc. | Access to Claude models via relay endpoint |
 
-### Cursor-style Dark UI
+### Dark UI
 
-- Dark theme consistent with Cursor/VS Code
+- Minimal dark theme
 - Collapsible blocks for thinking process, tool calls, and results
 - Dedicated **Python Shell** and **System Shell** widgets with syntax highlighting
 - **Node context bar** showing the currently selected Houdini node
@@ -150,7 +150,7 @@ Houdini-Agent/
     │   └── asset_checker.py        # Asset validation checker
     ├── ui/
     │   ├── ai_tab.py              # AI Agent tab (main UI, agent loop, context management)
-    │   ├── cursor_widgets.py      # Cursor-style widgets (theme, chat blocks, todo, shells)
+    │   ├── cursor_widgets.py      # UI widgets (theme, chat blocks, todo, shells)
     │   ├── chat_window.py         # Legacy chat window
     │   ├── widgets.py             # Custom Qt widgets
     │   └── dialogs.py            # Dialog boxes
@@ -253,7 +253,7 @@ Click the "Set API Key…" button and check "Save to local config".
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Context Management (Cursor-style)
+### Context Management
 
 - **Native tool message chain**: `assistant(tool_calls)` → `tool(result)` messages are passed directly to the model, preserving structured information
 - **Strict user/assistant alternation**: Ensures API compatibility across providers
@@ -344,8 +344,8 @@ Created attribwrangle1 with random Cd attribute on all points.
 
 ## Version History
 
-- **v6.0** — **Houdini Agent**: Cursor-style native tool chain, round-based context trimming, merged `get_node_details` into `get_node_parameters`, Skills system (8 analysis scripts), `execute_shell` tool, local doc RAG, Duojie/Ollama providers, multi-session tabs, thread-safe tool dispatch, connection retry logic
-- **v5.0** — Cursor-style UI: dark theme, collapsible blocks, stop button, auto context compression, code highlighting
+- **v6.0** — **Houdini Agent**: Native tool chain, round-based context trimming, merged `get_node_details` into `get_node_parameters`, Skills system (8 analysis scripts), `execute_shell` tool, local doc RAG, Duojie/Ollama providers, multi-session tabs, thread-safe tool dispatch, connection retry logic
+- **v5.0** — Dark UI overhaul: dark theme, collapsible blocks, stop button, auto context compression, code highlighting
 - **v4.0** — Agent mode: multi-turn tool calling, GLM-4 support
 - **v3.0** — Houdini-only tool (removed other DCC support)
 - **v2.0** — Multi-DCC architecture
