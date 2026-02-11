@@ -5,12 +5,21 @@ from PySide6 import QtWidgets
 
 # 强制重新加载模块，避免缓存问题
 def _reload_modules():
+    # ---- 清理旧包名残留（HOUDINI_HIP_MANAGER → houdini_agent 迁移） ----
+    old_mods = [k for k in sys.modules if k.startswith('HOUDINI_HIP_MANAGER')]
+    for k in old_mods:
+        del sys.modules[k]
+    
     modules_to_reload = [
-        'houdini_agent.ui.ai_tab',
-        'houdini_agent.ui.cursor_widgets',
-        'houdini_agent.core.main_window',
+        'houdini_agent.utils.token_optimizer',
+        'houdini_agent.utils.ultra_optimizer',
+        'houdini_agent.utils.training_data_exporter',
         'houdini_agent.utils.ai_client',
+        'houdini_agent.utils.mcp.client',
         'houdini_agent.utils.mcp',
+        'houdini_agent.ui.cursor_widgets',
+        'houdini_agent.ui.ai_tab',
+        'houdini_agent.core.main_window',
     ]
     for mod_name in modules_to_reload:
         if mod_name in sys.modules:

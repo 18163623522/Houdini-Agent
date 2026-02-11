@@ -23,6 +23,9 @@ config/houdini_ai.ini
 *_backup.py
 *_new.py
 
+# Legacy directory (renamed to houdini_agent)
+HOUDINI_HIP_MANAGER/
+
 # OS
 Thumbs.db
 .DS_Store

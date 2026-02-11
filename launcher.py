@@ -34,6 +34,11 @@ def launch_houdini_agent():
     if tool_path not in sys.path:
         sys.path.insert(0, tool_path)
     
+    # 清理旧包名残留（HOUDINI_HIP_MANAGER → houdini_agent 迁移）
+    old_mods = [k for k in sys.modules if k.startswith('HOUDINI_HIP_MANAGER')]
+    for k in old_mods:
+        del sys.modules[k]
+    
     try:
         if 'main' in sys.modules:
             import importlib

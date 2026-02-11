@@ -1893,6 +1893,58 @@ class AIClient:
                         # 完成（先发送工具调用，但不 return，等后续 usage chunk / [DONE]）
                         if finish_reason:
                             if tool_calls_buffer:
+                                # ★ 修复：检测并拆分被代理错误拼接的 arguments（如 duojie Claude 代理）
+                                # 某些代理在流式传输时对多个工具调用使用相同 index，导致 arguments 被拼接为 {...}{...}
+                                import uuid as _uuid
+                                fixed_buffer = {}
+                                next_fix_idx = max(tool_calls_buffer.keys()) + 1
+                                for idx_k in sorted(tool_calls_buffer.keys()):
+                                    tc_entry = tool_calls_buffer[idx_k]
+                                    args_str = tc_entry['function']['arguments'].strip()
+                                    if args_str.startswith('{'):
+                                        try:
+                                            json.loads(args_str)
+                                            fixed_buffer[idx_k] = tc_entry
+                                        except (json.JSONDecodeError, ValueError):
+                                            # 尝试拆分拼接的多个 JSON 对象: {...}{...}
+                                            split_parts = []
+                                            depth = 0
+                                            start = -1
+                                            for ci, ch in enumerate(args_str):
+                                                if ch == '{':
+                                                    if depth == 0:
+                                                        start = ci
+                                                    depth += 1
+                                                elif ch == '}':
+                                                    depth -= 1
+                                                    if depth == 0 and start >= 0:
+                                                        part = args_str[start:ci+1]
+                                                        try:
+                                                            json.loads(part)
+                                                            split_parts.append(part)
+                                                        except:
+                                                            pass
+                                                        start = -1
+                                            if split_parts:
+                                                print(f"[AI Client] 修复拼接的 tool_call arguments: 拆分为 {len(split_parts)} 个独立调用")
+                                                tc_entry['function']['arguments'] = split_parts[0]
+                                                fixed_buffer[idx_k] = tc_entry
+                                                for extra_args in split_parts[1:]:
+                                                    fixed_buffer[next_fix_idx] = {
+                                                        'id': f"call_{_uuid.uuid4().hex[:24]}",
+                                                        'type': 'function',
+                                                        'function': {
+                                                            'name': tc_entry['function']['name'],
+                                                            'arguments': extra_args
+                                                        }
+                                                    }
+                                                    next_fix_idx += 1
+                                            else:
+                                                fixed_buffer[idx_k] = tc_entry
+                                    else:
+                                        fixed_buffer[idx_k] = tc_entry
+                                tool_calls_buffer = fixed_buffer
+
                                 for idx_k in sorted(tool_calls_buffer.keys()):
                                     results.append({"type": "tool_call", "tool_call": tool_calls_buffer[idx_k]})
                                 tool_calls_buffer = {}
@@ -1939,6 +1991,55 @@ class AIClient:
                     
                     # 流结束但没有收到 [DONE]
                     if tool_calls_buffer:
+                        # ★ 同样需要修复拼接的 arguments（与 finish_reason 分支保持一致）
+                        import uuid as _uuid2
+                        fixed_buffer2 = {}
+                        next_fix_idx2 = max(tool_calls_buffer.keys()) + 1
+                        for idx_k2 in sorted(tool_calls_buffer.keys()):
+                            tc_entry2 = tool_calls_buffer[idx_k2]
+                            args_str2 = tc_entry2['function']['arguments'].strip()
+                            if args_str2.startswith('{'):
+                                try:
+                                    json.loads(args_str2)
+                                    fixed_buffer2[idx_k2] = tc_entry2
+                                except (json.JSONDecodeError, ValueError):
+                                    split_parts2 = []
+                                    depth2 = 0
+                                    start2 = -1
+                                    for ci2, ch2 in enumerate(args_str2):
+                                        if ch2 == '{':
+                                            if depth2 == 0:
+                                                start2 = ci2
+                                            depth2 += 1
+                                        elif ch2 == '}':
+                                            depth2 -= 1
+                                            if depth2 == 0 and start2 >= 0:
+                                                part2 = args_str2[start2:ci2+1]
+                                                try:
+                                                    json.loads(part2)
+                                                    split_parts2.append(part2)
+                                                except:
+                                                    pass
+                                                start2 = -1
+                                    if split_parts2:
+                                        print(f"[AI Client] 修复拼接的 tool_call arguments (尾部): 拆分为 {len(split_parts2)} 个独立调用")
+                                        tc_entry2['function']['arguments'] = split_parts2[0]
+                                        fixed_buffer2[idx_k2] = tc_entry2
+                                        for extra_args2 in split_parts2[1:]:
+                                            fixed_buffer2[next_fix_idx2] = {
+                                                'id': f"call_{_uuid2.uuid4().hex[:24]}",
+                                                'type': 'function',
+                                                'function': {
+                                                    'name': tc_entry2['function']['name'],
+                                                    'arguments': extra_args2
+                                                }
+                                            }
+                                            next_fix_idx2 += 1
+                                    else:
+                                        fixed_buffer2[idx_k2] = tc_entry2
+                            else:
+                                fixed_buffer2[idx_k2] = tc_entry2
+                        tool_calls_buffer = fixed_buffer2
                         for idx in sorted(tool_calls_buffer.keys()):
                             yield {"type": "tool_call", "tool_call": tool_calls_buffer[idx]}
                     yield {"type": "done", "finish_reason": last_finish_reason or "stop", "usage": pending_usage}
@@ -2413,6 +2514,36 @@ class AIClient:
             
             # 添加助手消息（确保 tool_call ID 完整）
             self._ensure_tool_call_ids(round_tool_calls)
+            
+            # ★ 防御性修复：确保每个 tool_call 的 arguments 是合法 JSON
+            # 某些代理（如 duojie）可能产生拼接的无效 JSON，存入历史后会导致下一轮 API 400 错误
+            for _tc in round_tool_calls:
+                _args_str = _tc.get('function', {}).get('arguments', '{}')
+                try:
+                    json.loads(_args_str)
+                except (json.JSONDecodeError, ValueError):
+                    # arguments 不是合法 JSON，尝试提取第一个完整 JSON 对象
+                    _depth = 0
+                    _start = -1
+                    _fixed = None
+                    for _ci, _ch in enumerate(_args_str):
+                        if _ch == '{':
+                            if _depth == 0:
+                                _start = _ci
+                            _depth += 1
+                        elif _ch == '}':
+                            _depth -= 1
+                            if _depth == 0 and _start >= 0:
+                                _candidate = _args_str[_start:_ci+1]
+                                try:
+                                    json.loads(_candidate)
+                                    _fixed = _candidate
+                                except:
+                                    pass
+                                break
+                    _tc['function']['arguments'] = _fixed if _fixed else '{}'
+                    print(f"[AI Client] 修正了无效的 tool_call arguments -> {_tc['function']['arguments'][:80]}")
+            
             assistant_msg = {'role': 'assistant', 'tool_calls': round_tool_calls}
             # content 为空时必须传 None（null）而非空字符串
             # Claude/Anthropic 兼容代理拒绝 content="" + tool_calls 共存
