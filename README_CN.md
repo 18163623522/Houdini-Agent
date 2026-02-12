@@ -67,7 +67,7 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 | `connect_nodes` | 连接两个节点（支持指定输入端口） |
 | `delete_node` | 删除节点 |
 | `copy_node` | 复制/克隆节点到同一或其他网络 |
-| `set_node_parameter` | 设置单个参数值（智能纠错 — 参数不存在时自动提示相似参数名） |
+| `set_node_parameter` | 设置单个参数值（智能纠错、内联红绿 Diff 预览、一键撤销） |
 | `batch_set_parameters` | 批量设置多个节点的同一参数 |
 | `set_display_flag` | 设置节点的显示/渲染标志 |
 | `save_hip` | 保存当前 HIP 文件 |
@@ -368,6 +368,7 @@ Agent：[create_wrangle_node: vex_code="@Cd = set(rand(@ptnum), rand(@ptnum*13.3
 
 ## 版本历史
 
+- **v6.4** — **参数 Diff UI**：`set_node_parameter` 显示内联红绿 diff（标量值）和可折叠统一 diff（多行 VEX 代码），支持一键撤销恢复旧值（标量/元组/表达式）。**用户消息折叠**：超过 2 行的消息自动折叠，点击展开/收起。**场景感知 RAG**：用选中节点类型增强检索查询，根据对话长度动态调整注入量（400/800/1200 字符）。**持久化 HTTP Session**：连接池复用，消除每轮 TLS 握手开销。**预编译正则**：XML 标签清洗模式类级编译一次。**消息清洗脏标志**：无新 tool 消息时跳过 O(n) 遍历。**去除工具间延迟**：Houdini 工具执行之间不再 sleep。
 - **v6.3** — **图片放大预览**：点击缩略图弹出全尺寸查看窗口。**`<think>` 标签强制规则升级**：系统提示词将缺失标签视为格式违规；工具执行后的后续回复同样要求标签。**健壮的 usage 解析**：统一处理 DeepSeek、OpenAI、Anthropic 和 Factory/拼好饭中转的缓存命中/未命中/写入指标（含首次诊断输出）。**精确节点路径提取**：`_extract_node_paths` 按工具类型使用专用正则，避免提取父网络等上下文路径。**多模态 Token 计算**：图片按 ~765 Token 估算，预算跟踪更准确。**Duojie 思考模式**：弃用 `reasoningEffort` 参数（实测无效），改为纯 `<think>` 标签提示。工具 Schema：数组参数值增加 `items` 类型提示。
 - **v6.2** — **图片/多模态输入**：支持粘贴/拖拽/文件选择器附加图片，发送前缩略图预览，模型视觉能力自动检测。**Wrangle run_over 指导**：系统提示词新增 VEX 执行上下文选择规则（防止错误的 run_over 模式）。**新增模型**：`gpt-5.3-codex`、`claude-opus-4-6-normal`、`claude-opus-4-6-kiro`。**代理 tool_call 修复**：健壮拆分中转服务拼接的 `{...}{...}` arguments。**旧模块清理**：启动时自动清理 `HOUDINI_HIP_MANAGER` 残留模块。
 - **v6.1** — 可点击节点路径、Token 费用追踪（tiktoken + 按模型计费）、Token 分析面板、参数智能纠错提示、`verify_and_summarize` 优化（内置网络检查）、重复调用去重、文档查阅建议、连接指数退避重试、模型默认值更新（GLM-4.7、GPT-5.2、Gemini-3-Pro）
