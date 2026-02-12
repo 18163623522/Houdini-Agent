@@ -1124,6 +1124,15 @@ class AIClient:
     OLLAMA_API_URL = "http://localhost:11434/v1/chat/completions"  # Ollama OpenAI 兼容接口
     DUOJIE_API_URL = "https://api.duojie.games/v1/chat/completions"  # 拼好饭中转站
 
+    # ★ 预编译流式内容清洗正则（避免每个 SSE chunk 都重新编译）
+    _RE_CLEAN_PATTERNS = [
+        re.compile(r'</?tool_call[^>]*>'),
+        re.compile(r'<arg_key>([^<]+)</arg_key>\s*<arg_value>([^<]+)</arg_value>'),
+        re.compile(r'</?arg_key[^>]*>'),
+        re.compile(r'</?arg_value[^>]*>'),
+        re.compile(r'</?redacted_reasoning[^>]*>'),
+    ]
+
     def __init__(self, api_key: Optional[str] = None):
         self._api_keys: Dict[str, Optional[str]] = {
             'openai': api_key or self._read_api_key('openai'),
@@ -1143,6 +1152,12 @@ class AIClient:
         self._max_retries = 3
         self._retry_delay = 1.0
         self._chunk_timeout = 60  # Ollama 本地模型可能较慢，增加超时
+        
+        # ★ 持久化 HTTP Session（连接池 + Keep-Alive，避免每轮重新 TLS 握手）
+        self._http_session = requests.Session()
+        self._http_session.headers.update({
+            'Content-Type': 'application/json',
+        })
         
         # 停止控制（使用 threading.Event 保证线程安全）
         import threading
@@ -1573,7 +1588,7 @@ class AIClient:
             return ['qwen2.5:14b']
         
         try:
-            response = requests.get(
+            response = self._http_session.get(
                 f"{self._ollama_base_url}/api/tags",
                 timeout=5
             )
@@ -1594,7 +1609,7 @@ class AIClient:
         if provider == 'ollama':
             try:
                 if HAS_REQUESTS:
-                    response = requests.get(
+                    response = self._http_session.get(
                         f"{self._ollama_base_url}/api/tags",
                         timeout=5
                     )
@@ -1610,7 +1625,7 @@ class AIClient:
         
         try:
             if HAS_REQUESTS:
-                response = requests.post(
+                response = self._http_session.post(
                     self._get_api_url(provider),
                     json={'model': self._get_default_model(provider), 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 1},
                     headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
@@ -1834,7 +1849,7 @@ class AIClient:
         print(f"[AI Client] Requesting {api_url} with model {model}")
         for attempt in range(self._max_retries):
             try:
-                with requests.post(
+                with self._http_session.post(
                     api_url,
                     json=payload,
                     headers=headers,
@@ -2186,7 +2201,7 @@ class AIClient:
         
         for attempt in range(self._max_retries):
             try:
-                response = requests.post(
+                response = self._http_session.post(
                     self._get_api_url(provider),
                     json=payload,
                     headers=headers,
@@ -2283,6 +2298,9 @@ class AIClient:
         # key: "tool_name:sorted_args_json" → value: result dict
         _turn_dedup_cache: Dict[str, dict] = {}
         
+        # ★ 消息清洗 dirty 标志（避免每轮都 O(n) 遍历消息列表）
+        _needs_sanitize = True
+        
         while iteration < max_iterations:
             # 检查停止请求
             if self._stop_event.is_set():
@@ -2310,8 +2328,10 @@ class AIClient:
             should_abort = False  # 不可恢复错误标志
             abort_error = ""
             
-            # 发送前清洗消息（修复 tool_call_id 缺失等问题）
-            working_messages = self._sanitize_working_messages(working_messages)
+            # 发送前清洗消息（仅在新增 tool 消息后才需要，避免无谓的 O(n) 遍历）
+            if _needs_sanitize:
+                working_messages = self._sanitize_working_messages(working_messages)
+                _needs_sanitize = False
             
             # ⚠️ Cursor 风格：同一轮 agent turn 内，所有消息完整保留
             # - assistant 消息永不截断
@@ -2370,13 +2390,10 @@ class AIClient:
                 
                 if chunk_type == 'content':
                     content = chunk.get('content', '')
-                    # 清理XML标签（在流式输出时就清理，避免污染）
-                    import re
-                    cleaned_chunk = re.sub(r'</?tool_call[^>]*>', '', content)
-                    cleaned_chunk = re.sub(r'<arg_key>([^<]+)</arg_key>\s*<arg_value>([^<]+)</arg_value>', '', cleaned_chunk)
-                    cleaned_chunk = re.sub(r'</?arg_key[^>]*>', '', cleaned_chunk)
-                    cleaned_chunk = re.sub(r'</?arg_value[^>]*>', '', cleaned_chunk)
-                    cleaned_chunk = re.sub(r'</?redacted_reasoning[^>]*>', '', cleaned_chunk)
+                    # 清理XML标签（使用预编译正则，避免每 chunk 重复编译）
+                    cleaned_chunk = content
+                    for _pat in self._RE_CLEAN_PATTERNS:
+                        cleaned_chunk = _pat.sub('', cleaned_chunk)
                     round_content += cleaned_chunk
                     if on_content and cleaned_chunk:
                         on_content(cleaned_chunk)
@@ -2681,8 +2698,6 @@ class AIClient:
             # --- 串行执行未缓存的 Houdini 工具（需主线程） ---
             for idx, (tid, tname, targs, _tc) in uncached_houdini:
                 results_ordered[idx] = self._tool_executor(tname, **targs)
-                # Houdini 工具间延迟，防止 API 过快
-                time.sleep(0.05)
             
             # --- 缓存维护 ---
             # 如果本轮有操作类工具（创建/删除/连接节点等），清除网络结构相关缓存
@@ -2753,6 +2768,7 @@ class AIClient:
                     'tool_call_id': tool_id,
                     'content': result_content
                 })
+                _needs_sanitize = True  # 新增 tool 消息，下轮需要清洗
 
             if should_break_tool_limit:
                 return {
@@ -3254,15 +3270,10 @@ class AIClient:
                     })
                     break
             
-            # 清理内容中的XML标签和格式问题（更彻底的清理）
-            import re
+            # 清理内容中的XML标签和格式问题（使用预编译正则）
             cleaned_content = round_content
-            # 清理所有XML标签
-            cleaned_content = re.sub(r'</?tool_call[^>]*>', '', cleaned_content)
-            cleaned_content = re.sub(r'<arg_key>([^<]+)</arg_key>\s*<arg_value>([^<]+)</arg_value>', '', cleaned_content)
-            cleaned_content = re.sub(r'</?arg_key[^>]*>', '', cleaned_content)
-            cleaned_content = re.sub(r'</?arg_value[^>]*>', '', cleaned_content)
-            cleaned_content = re.sub(r'</?redacted_reasoning[^>]*>', '', cleaned_content)
+            for _pat in self._RE_CLEAN_PATTERNS:
+                cleaned_content = _pat.sub('', cleaned_content)
             # 清理其他可能的XML标签
             cleaned_content = re.sub(r'<[^>]+>', '', cleaned_content)  # 清理所有剩余的XML标签
             
@@ -3348,7 +3359,6 @@ class AIClient:
                     except Exception as e:
                         import traceback
                         exec_results[idx] = {"success": False, "error": f"工具执行异常: {str(e)}\n{traceback.format_exc()[:200]}"}
-                time.sleep(0.05)
 
             # 统一处理结果
             should_break_limit = False
@@ -3442,15 +3452,10 @@ class AIClient:
                 'content': f'[TOOL_RESULT]\n{prompt}'
             })
             
-            # 保存当前轮次的内容（清理XML标签，避免重复）
-            import re
+            # 保存当前轮次的内容（使用预编译正则清理XML标签）
             cleaned_round = round_content
-            # 更彻底的XML标签清理
-            cleaned_round = re.sub(r'</?tool_call[^>]*>', '', cleaned_round)
-            cleaned_round = re.sub(r'<arg_key>([^<]+)</arg_key>\s*<arg_value>([^<]+)</arg_value>', '', cleaned_round)
-            cleaned_round = re.sub(r'</?arg_key[^>]*>', '', cleaned_round)
-            cleaned_round = re.sub(r'</?arg_value[^>]*>', '', cleaned_round)
-            cleaned_round = re.sub(r'</?redacted_reasoning[^>]*>', '', cleaned_round)
+            for _pat in self._RE_CLEAN_PATTERNS:
+                cleaned_round = _pat.sub('', cleaned_round)
             cleaned_round = re.sub(r'<[^>]+>', '', cleaned_round)  # 清理所有剩余的XML标签
             # 只添加非空且不重复的内容
             if cleaned_round.strip():

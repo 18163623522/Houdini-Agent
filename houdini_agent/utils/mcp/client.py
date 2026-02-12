@@ -1739,14 +1739,19 @@ class HoudiniMCP:
     # 参数设置
     # ========================================
     
-    def set_parameter(self, node_path: str, param_name: str, value: Any) -> Tuple[bool, str]:
-        """设置节点参数"""
+    def set_parameter(self, node_path: str, param_name: str, value: Any) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """设置节点参数（设置前自动快照旧值，支持撤销）
+        
+        Returns:
+            (success, message, undo_snapshot)
+            undo_snapshot 包含 node_path, param_name, old_value, new_value
+        """
         if hou is None:
-            return False, "未检测到 Houdini API"
+            return False, "未检测到 Houdini API", None
         
         node = hou.node(node_path)
         if node is None:
-            return False, f"未找到节点: {node_path}"
+            return False, f"未找到节点: {node_path}", None
         
         # 尝试获取参数
         parm = node.parm(param_name)
@@ -1770,23 +1775,48 @@ class HoudiniMCP:
                             err += f" ... 共 {len(all_parms)} 个"
                 except Exception:
                     err = f"未找到参数: {param_name}"
-                return False, err
+                return False, err, None
             
             if isinstance(value, (list, tuple)):
                 try:
+                    # 快照旧值（元组参数）
+                    old_value = list(parm_tuple.eval())
                     parm_tuple.set(value)
-                    return True, f"已设置 {param_name} = {value}"
+                    new_value = list(parm_tuple.eval())
+                    snapshot = {
+                        "node_path": node_path,
+                        "param_name": param_name,
+                        "old_value": old_value,
+                        "new_value": new_value,
+                        "is_tuple": True,
+                    }
+                    return True, f"已设置 {node_path} {param_name}: {old_value} → {new_value}", snapshot
                 except Exception as exc:
-                    return False, f"设置失败: {exc}"
+                    return False, f"设置失败: {exc}", None
             else:
-                return False, f"参数 {param_name} 需要列表或元组值"
+                return False, f"参数 {param_name} 需要列表或元组值", None
         
         try:
+            # 快照旧值（标量参数）
+            try:
+                old_expr = parm.expression()
+                old_lang = str(parm.expressionLanguage())
+                old_value = {"expr": old_expr, "lang": old_lang}
+            except Exception:
+                old_value = parm.eval()
+            
             parm.set(value)
             actual_value = parm.eval()
-            return True, f"已设置 {param_name} = {actual_value}"
+            snapshot = {
+                "node_path": node_path,
+                "param_name": param_name,
+                "old_value": old_value,
+                "new_value": actual_value,
+                "is_tuple": False,
+            }
+            return True, f"已设置 {node_path} {param_name}: {old_value} → {actual_value}", snapshot
         except Exception as exc:
-            return False, f"设置失败: {exc}"
+            return False, f"设置失败: {exc}", None
 
     # ========================================
     # 节点删除
@@ -2276,8 +2306,11 @@ class HoudiniMCP:
             missing.append("param_name(参数名)")
         if missing:
             return {"success": False, "error": f"缺少必要参数: {', '.join(missing)}"}
-        ok, msg = self.set_parameter(node_path, param_name, value)
-        return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+        ok, msg, snapshot = self.set_parameter(node_path, param_name, value)
+        result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+        if ok and snapshot:
+            result["_undo_snapshot"] = snapshot  # 供 UI 撤销使用，不会发给 AI
+        return result
 
     def _tool_create_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_type = args.get("node_type", "")

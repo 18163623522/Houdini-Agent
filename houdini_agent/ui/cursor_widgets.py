@@ -594,30 +594,108 @@ class ClickableImageLabel(QtWidgets.QLabel):
 # ============================================================
 
 class UserMessage(QtWidgets.QWidget):
-    """用户消息 - 简洁显示"""
-    
+    """用户消息 - 支持折叠（超过 2 行时自动折叠，点击展开/收起）"""
+
+    _COLLAPSED_MAX_LINES = 2  # 折叠时显示的最大行数
+
     def __init__(self, text: str, parent=None):
         super().__init__(parent)
-        
+        self._full_text = text
+        self._collapsed = False  # 初始状态由 _maybe_collapse 决定
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 4)
-        layout.setSpacing(2)
-        
-        # 用户消息内容
+        layout.setSpacing(0)
+
+        # ---- 主容器（带左边框） ----
+        self._container = QtWidgets.QWidget()
+        self._container.setStyleSheet(f"""
+            QWidget#userMsgContainer {{
+                background: {CursorTheme.BG_TERTIARY};
+                border-left: 3px solid {CursorTheme.BORDER_USER};
+            }}
+        """)
+        self._container.setObjectName("userMsgContainer")
+        container_layout = QtWidgets.QVBoxLayout(self._container)
+        container_layout.setContentsMargins(12, 8, 12, 4)
+        container_layout.setSpacing(2)
+
+        # ---- 内容标签 ----
         self.content = QtWidgets.QLabel(text)
         self.content.setWordWrap(True)
+        self.content.setTextFormat(QtCore.Qt.PlainText)
         self.content.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.content.setStyleSheet(f"""
             QLabel {{
                 color: {CursorTheme.TEXT_BRIGHT};
                 font-size: 16px;
                 font-family: {CursorTheme.FONT_BODY};
-                padding: 8px 12px;
-                background: {CursorTheme.BG_TERTIARY};
-                border-left: 3px solid {CursorTheme.BORDER_USER};
+                background: transparent;
             }}
         """)
-        layout.addWidget(self.content)
+        container_layout.addWidget(self.content)
+
+        # ---- 展开/收起 按钮 ----
+        self._toggle_btn = QtWidgets.QPushButton()
+        self._toggle_btn.setFlat(True)
+        self._toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._toggle_btn.setFixedHeight(20)
+        self._toggle_btn.setStyleSheet(f"""
+            QPushButton {{
+                color: {CursorTheme.TEXT_MUTED};
+                font-size: 12px;
+                font-family: {CursorTheme.FONT_BODY};
+                border: none;
+                background: transparent;
+                text-align: left;
+                padding: 0;
+            }}
+            QPushButton:hover {{
+                color: {CursorTheme.ACCENT_BLUE};
+            }}
+        """)
+        self._toggle_btn.clicked.connect(self._toggle_collapse)
+        self._toggle_btn.setVisible(False)  # 默认隐藏，_maybe_collapse 决定
+        container_layout.addWidget(self._toggle_btn)
+
+        layout.addWidget(self._container)
+
+        # 延迟判断是否需要折叠（等 QLabel 完成布局后再算行数）
+        QtCore.QTimer.singleShot(0, self._maybe_collapse)
+
+    # ------------------------------------------------------------------
+    def _maybe_collapse(self):
+        """检查文本是否超过阈值行数，超过则自动折叠"""
+        line_count = self._full_text.count('\n') + 1
+        if line_count > self._COLLAPSED_MAX_LINES:
+            self._collapsed = True
+            self._apply_collapsed()
+            self._toggle_btn.setVisible(True)
+        else:
+            # 文字不够多，不需要折叠按钮
+            self._toggle_btn.setVisible(False)
+
+    def _apply_collapsed(self):
+        """应用折叠状态：只显示前 N 行 + 省略号"""
+        lines = self._full_text.split('\n')
+        preview = '\n'.join(lines[:self._COLLAPSED_MAX_LINES])
+        if len(lines) > self._COLLAPSED_MAX_LINES:
+            preview += ' …'
+        self.content.setText(preview)
+        remaining = len(lines) - self._COLLAPSED_MAX_LINES
+        self._toggle_btn.setText(f"▶ 展开 ({remaining} 行更多)")
+
+    def _apply_expanded(self):
+        """应用展开状态：显示完整文本"""
+        self.content.setText(self._full_text)
+        self._toggle_btn.setText("▼ 收起")
+
+    def _toggle_collapse(self):
+        self._collapsed = not self._collapsed
+        if self._collapsed:
+            self._apply_collapsed()
+        else:
+            self._apply_expanded()
 
 
 # ============================================================
@@ -1013,10 +1091,25 @@ class NodeOperationLabel(QtWidgets.QWidget):
         }}}}
     """
     
-    def __init__(self, operation: str, count: int, node_paths: list = None, parent=None):
+    def __init__(self, operation: str, count: int, node_paths: list = None, 
+                 detail_text: str = None, param_diff: dict = None, parent=None):
+        """
+        Args:
+            operation: 'create' | 'delete' | 'modify'
+            count: 操作的节点/参数数量
+            node_paths: 节点路径列表
+            detail_text: 简单文本详情 (旧方式, 纯文字)
+            param_diff: 参数 diff 信息 {"param_name": str, "old_value": Any, "new_value": Any}
+        """
         super().__init__(parent)
         self._node_paths = node_paths or []
         self._decided = False  # 用户是否已做出选择
+        
+        # 如果有 param_diff，使用垂直布局（标题行 + diff 区域）
+        # 否则使用原来的水平布局
+        if param_diff and operation == 'modify':
+            self._init_modify_layout(operation, count, param_diff)
+            return
         
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 2)
@@ -1025,11 +1118,17 @@ class NodeOperationLabel(QtWidgets.QWidget):
         if operation == 'create':
             prefix = "+"
             color = CursorTheme.ACCENT_GREEN
+        elif operation == 'modify':
+            prefix = "~"
+            color = CursorTheme.ACCENT_YELLOW
         else:
             prefix = "-"
             color = CursorTheme.ACCENT_RED
         
-        plural = "nodes" if count > 1 else "node"
+        if operation == 'modify':
+            plural = "params" if count > 1 else "param"
+        else:
+            plural = "nodes" if count > 1 else "node"
         count_text = f"{prefix}{count} {plural}"
         
         count_label = QtWidgets.QLabel(count_text)
@@ -1077,6 +1176,17 @@ class NodeOperationLabel(QtWidgets.QWidget):
             more.setStyleSheet(f"color: {CursorTheme.TEXT_MUTED}; font-size: 10px;")
             layout.addWidget(more)
         
+        # 简单文本详情（仅在没有 param_diff 时使用）
+        if detail_text:
+            detail_label = QtWidgets.QLabel(detail_text)
+            detail_label.setStyleSheet(f"""
+                color: {CursorTheme.TEXT_SECONDARY};
+                font-size: 11px;
+                font-family: {CursorTheme.FONT_CODE};
+            """)
+            detail_label.setToolTip(detail_text)
+            layout.addWidget(detail_label)
+        
         layout.addStretch()
         
         # ── Undo / Keep 按钮 ──
@@ -1108,6 +1218,97 @@ class NodeOperationLabel(QtWidgets.QWidget):
         self._status_label.setVisible(False)
         layout.addWidget(self._status_label)
     
+    def _init_modify_layout(self, operation: str, count: int, param_diff: dict):
+        """modify 操作的专用布局：标题行(黄标签+节点名+undo/keep) + diff 展示区"""
+        self._decided = False
+        
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 2, 0, 2)
+        root.setSpacing(2)
+        
+        # ── 第一行：标签 + 节点名 + undo/keep ──
+        header = QtWidgets.QHBoxLayout()
+        header.setSpacing(4)
+        
+        color = CursorTheme.ACCENT_YELLOW
+        plural = "params" if count > 1 else "param"
+        count_label = QtWidgets.QLabel(f"~{count} {plural}")
+        count_label.setStyleSheet(f"""
+            QLabel {{
+                color: {color};
+                font-size: 13px;
+                font-family: {CursorTheme.FONT_BODY};
+                font-weight: bold;
+                padding: 2px 6px;
+                background: {CursorTheme.BG_TERTIARY};
+                border-radius: 3px;
+            }}
+        """)
+        header.addWidget(count_label)
+        
+        for path in self._node_paths[:3]:
+            short_name = path.rsplit('/', 1)[-1] if '/' in path else path
+            btn = QtWidgets.QPushButton(short_name)
+            btn.setFlat(True)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            btn.setToolTip(f"点击跳转: {path}")
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    color: {CursorTheme.ACCENT_BEIGE};
+                    font-size: 12px;
+                    font-family: {CursorTheme.FONT_CODE};
+                    padding: 1px 4px;
+                    border: 1px solid transparent;
+                    text-decoration: underline;
+                }}
+                QPushButton:hover {{
+                    color: {CursorTheme.TEXT_BRIGHT};
+                    background: {CursorTheme.BG_HOVER};
+                    border-color: {CursorTheme.BORDER};
+                }}
+            """)
+            btn.clicked.connect(lambda checked=False, p=path: self.nodeClicked.emit(p))
+            header.addWidget(btn)
+        
+        header.addStretch()
+        
+        self._undo_btn = QtWidgets.QPushButton("undo")
+        self._undo_btn.setFixedHeight(20)
+        self._undo_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._undo_btn.setStyleSheet(self._BTN_STYLE.format(
+            color=CursorTheme.ACCENT_RED, border=CursorTheme.ACCENT_RED,
+            hover=CursorTheme.BG_HOVER))
+        self._undo_btn.clicked.connect(self._on_undo)
+        header.addWidget(self._undo_btn)
+        
+        self._keep_btn = QtWidgets.QPushButton("keep")
+        self._keep_btn.setFixedHeight(20)
+        self._keep_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._keep_btn.setStyleSheet(self._BTN_STYLE.format(
+            color=CursorTheme.ACCENT_GREEN, border=CursorTheme.ACCENT_GREEN,
+            hover=CursorTheme.BG_HOVER))
+        self._keep_btn.clicked.connect(self._on_keep)
+        header.addWidget(self._keep_btn)
+        
+        self._status_label = QtWidgets.QLabel()
+        self._status_label.setStyleSheet(f"""
+            color: {CursorTheme.TEXT_MUTED};
+            font-size: 11px;
+            font-family: {CursorTheme.FONT_BODY};
+        """)
+        self._status_label.setVisible(False)
+        header.addWidget(self._status_label)
+        
+        root.addLayout(header)
+        
+        # ── 第二行：Diff 展示 ──
+        diff_widget = ParamDiffWidget(
+            param_name=param_diff.get("param_name", ""),
+            old_value=param_diff.get("old_value", ""),
+            new_value=param_diff.get("new_value", ""),
+        )
+        root.addWidget(diff_widget)
+    
     def _on_undo(self):
         if self._decided:
             return
@@ -1131,6 +1332,232 @@ class NodeOperationLabel(QtWidgets.QWidget):
         self._keep_btn.setVisible(False)
         self._status_label.setText("已保留")
         self._status_label.setVisible(True)
+
+
+# ============================================================
+# 参数 Diff 展示组件
+# ============================================================
+
+class ParamDiffWidget(QtWidgets.QWidget):
+    """参数变更 Diff 展示 — 旧值红框 / 新值绿框
+    
+    - 标量/短文本: 内联显示  [old_value] → [new_value]
+    - 多行文本(VEX等): 展开式 diff, 红色背景删除行, 绿色背景新增行
+    """
+    
+    # diff 颜色
+    _RED_BG = "#3d1f1f"       # 删除行背景
+    _RED_BORDER = "#6e3030"   # 删除行边框
+    _RED_TEXT = "#f48771"     # 删除行文字
+    _GREEN_BG = "#1f3d1f"     # 新增行背景
+    _GREEN_BORDER = "#2e6e30" # 新增行边框
+    _GREEN_TEXT = "#89d185"   # 新增行文字
+    _GREY_TEXT = "#6a6a6a"    # 上下文行文字
+    
+    def __init__(self, param_name: str, old_value, new_value, parent=None):
+        super().__init__(parent)
+        self._collapsed = True
+        
+        old_str = self._to_str(old_value)
+        new_str = self._to_str(new_value)
+        is_multiline = ('\n' in old_str or '\n' in new_str
+                        or len(old_str) > 60 or len(new_str) > 60)
+        
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 2, 0, 2)
+        root_layout.setSpacing(2)
+        
+        if is_multiline:
+            # ── 多行 diff (VEX 等) ──
+            # 标题行: param_name ▶
+            self._title_text = param_name
+            self._toggle_btn = QtWidgets.QPushButton(f"▶ {param_name}")
+            self._toggle_btn.setFlat(True)
+            self._toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            self._toggle_btn.setStyleSheet(f"""
+                QPushButton {{
+                    color: {CursorTheme.ACCENT_YELLOW};
+                    font-size: 11px;
+                    font-family: {CursorTheme.FONT_CODE};
+                    text-align: left;
+                    padding: 1px 4px;
+                    border: none;
+                    background: transparent;
+                }}
+                QPushButton:hover {{
+                    color: {CursorTheme.TEXT_BRIGHT};
+                }}
+            """)
+            self._toggle_btn.clicked.connect(self._toggle)
+            root_layout.addWidget(self._toggle_btn)
+            
+            # diff 内容区（默认折叠）
+            self._diff_frame = QtWidgets.QFrame()
+            self._diff_frame.setStyleSheet(f"""
+                QFrame {{
+                    background: {CursorTheme.BG_PRIMARY};
+                    border: 1px solid {CursorTheme.BORDER};
+                    border-radius: 4px;
+                }}
+            """)
+            diff_layout = QtWidgets.QVBoxLayout(self._diff_frame)
+            diff_layout.setContentsMargins(6, 4, 6, 4)
+            diff_layout.setSpacing(0)
+            
+            # 使用 difflib 计算行级 diff
+            import difflib
+            old_lines = old_str.splitlines(keepends=True)
+            new_lines = new_str.splitlines(keepends=True)
+            diff = list(difflib.unified_diff(old_lines, new_lines, n=2))
+            
+            # 跳过 --- / +++ 头两行, 取实际 diff 行
+            diff_body = diff[2:] if len(diff) > 2 else []
+            
+            if not diff_body:
+                # 没有实际差异（或 difflib 无法处理）→ 并排显示
+                self._add_block(diff_layout, "旧值", old_str, is_old=True)
+                self._add_block(diff_layout, "新值", new_str, is_old=False)
+            else:
+                for line in diff_body:
+                    line_stripped = line.rstrip('\n')
+                    if line.startswith('@@'):
+                        # 段落头
+                        lbl = QtWidgets.QLabel(line_stripped)
+                        lbl.setStyleSheet(f"""
+                            color: {CursorTheme.ACCENT_PURPLE};
+                            font-size: 11px;
+                            font-family: {CursorTheme.FONT_CODE};
+                            padding: 1px 4px;
+                        """)
+                        diff_layout.addWidget(lbl)
+                    elif line.startswith('-'):
+                        lbl = QtWidgets.QLabel(line_stripped)
+                        lbl.setStyleSheet(f"""
+                            color: {self._RED_TEXT};
+                            background: {self._RED_BG};
+                            border-left: 3px solid {self._RED_BORDER};
+                            font-size: 11px;
+                            font-family: {CursorTheme.FONT_CODE};
+                            padding: 1px 4px;
+                        """)
+                        diff_layout.addWidget(lbl)
+                    elif line.startswith('+'):
+                        lbl = QtWidgets.QLabel(line_stripped)
+                        lbl.setStyleSheet(f"""
+                            color: {self._GREEN_TEXT};
+                            background: {self._GREEN_BG};
+                            border-left: 3px solid {self._GREEN_BORDER};
+                            font-size: 11px;
+                            font-family: {CursorTheme.FONT_CODE};
+                            padding: 1px 4px;
+                        """)
+                        diff_layout.addWidget(lbl)
+                    else:
+                        # 上下文行
+                        lbl = QtWidgets.QLabel(line_stripped)
+                        lbl.setStyleSheet(f"""
+                            color: {self._GREY_TEXT};
+                            font-size: 11px;
+                            font-family: {CursorTheme.FONT_CODE};
+                            padding: 1px 4px;
+                        """)
+                        diff_layout.addWidget(lbl)
+            
+            self._diff_frame.setVisible(False)
+            root_layout.addWidget(self._diff_frame)
+        else:
+            # ── 内联 diff (标量) ──
+            inline = QtWidgets.QHBoxLayout()
+            inline.setContentsMargins(0, 0, 0, 0)
+            inline.setSpacing(4)
+            
+            # 参数名
+            name_lbl = QtWidgets.QLabel(f"{param_name}:")
+            name_lbl.setStyleSheet(f"""
+                color: {CursorTheme.TEXT_SECONDARY};
+                font-size: 11px;
+                font-family: {CursorTheme.FONT_CODE};
+            """)
+            inline.addWidget(name_lbl)
+            
+            # 旧值 (红框)
+            old_lbl = QtWidgets.QLabel(self._truncate(old_str, 30))
+            old_lbl.setToolTip(f"旧值: {old_str}")
+            old_lbl.setStyleSheet(f"""
+                QLabel {{
+                    color: {self._RED_TEXT};
+                    background: {self._RED_BG};
+                    border: 1px solid {self._RED_BORDER};
+                    border-radius: 3px;
+                    font-size: 11px;
+                    font-family: {CursorTheme.FONT_CODE};
+                    padding: 1px 6px;
+                }}
+            """)
+            inline.addWidget(old_lbl)
+            
+            # 箭头
+            arrow = QtWidgets.QLabel("→")
+            arrow.setStyleSheet(f"""
+                color: {CursorTheme.TEXT_MUTED};
+                font-size: 11px;
+            """)
+            inline.addWidget(arrow)
+            
+            # 新值 (绿框)
+            new_lbl = QtWidgets.QLabel(self._truncate(new_str, 30))
+            new_lbl.setToolTip(f"新值: {new_str}")
+            new_lbl.setStyleSheet(f"""
+                QLabel {{
+                    color: {self._GREEN_TEXT};
+                    background: {self._GREEN_BG};
+                    border: 1px solid {self._GREEN_BORDER};
+                    border-radius: 3px;
+                    font-size: 11px;
+                    font-family: {CursorTheme.FONT_CODE};
+                    padding: 1px 6px;
+                }}
+            """)
+            inline.addWidget(new_lbl)
+            
+            root_layout.addLayout(inline)
+    
+    def _toggle(self):
+        self._collapsed = not self._collapsed
+        self._diff_frame.setVisible(not self._collapsed)
+        arrow = "▶" if self._collapsed else "▼"
+        self._toggle_btn.setText(f"{arrow} {self._title_text}")
+    
+    def _add_block(self, parent_layout, title: str, text: str, is_old: bool):
+        """添加旧值/新值整块（用于 difflib 无差异时的 fallback）"""
+        if is_old:
+            bg, border, fg = self._RED_BG, self._RED_BORDER, self._RED_TEXT
+        else:
+            bg, border, fg = self._GREEN_BG, self._GREEN_BORDER, self._GREEN_TEXT
+        header = QtWidgets.QLabel(title)
+        header.setStyleSheet(f"color: {fg}; font-size: 10px; font-family: {CursorTheme.FONT_CODE}; padding: 2px 4px;")
+        parent_layout.addWidget(header)
+        for line in text.splitlines():
+            lbl = QtWidgets.QLabel(line)
+            lbl.setStyleSheet(f"""
+                color: {fg}; background: {bg};
+                border-left: 3px solid {border};
+                font-size: 11px; font-family: {CursorTheme.FONT_CODE};
+                padding: 1px 4px;
+            """)
+            parent_layout.addWidget(lbl)
+    
+    @staticmethod
+    def _to_str(value) -> str:
+        if isinstance(value, dict) and "expr" in value:
+            return str(value["expr"])
+        if isinstance(value, (list, tuple)):
+            return ', '.join(str(v) for v in value)
+        return str(value)
+    
+    @staticmethod
+    def _truncate(s: str, max_len: int) -> str:
+        return s if len(s) <= max_len else s[:max_len - 1] + "…"
 
 
 # ============================================================

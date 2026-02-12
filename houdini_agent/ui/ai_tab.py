@@ -52,7 +52,7 @@ class AITab(QtWidgets.QWidget):
     _agentError = QtCore.Signal(str)
     _agentStopped = QtCore.Signal()
     _updateTodo = QtCore.Signal(str, str, str)  # (todo_id, text, status)
-    _addNodeOperation = QtCore.Signal(str, str)  # (name, result_json)
+    _addNodeOperation = QtCore.Signal(str, object)  # (name, result_dict) ★ 直接传 dict，避免 JSON 序列化/反序列化开销
     _addPythonShell = QtCore.Signal(str, str)  # (code, result_json)
     _addSystemShell = QtCore.Signal(str, str)  # (command, result_json)
     _executeToolRequest = QtCore.Signal(str, dict)  # 工具执行请求信号（线程安全）
@@ -276,7 +276,7 @@ copytopoints 第0输入=模板几何体，第1输入=目标点。需要一个小
 
 Wrangle 节点 Run Over 模式（极其重要，每次创建 wrangle 必须考虑）:
 -创建 wrangle 节点时，**必须根据 VEX 代码的实际操作对象选择正确的 run_over 模式**，不能一律使用默认的 Points
--run_over 决定了 VEX 代码的执行上下文：Points（逐点执行）、Primitives（逐面执行）、Vertices（逐顶点执行）、Detail（全局执行一次）
+-run_over 决定了 VEX 代码的执行上下文：Points（逐点执行）、Primitives（逐图元执行）、Vertices（逐顶点执行）、Detail（全局执行一次）
 -选择错误的 run_over 会导致 VEX 代码完全无法正常工作，或产生错误结果
 -判断规则:
   如果代码操作 @P, @N, @pscale, @Cd 等点属性，或用 @ptnum, @numpt → 使用 Points
@@ -1656,14 +1656,14 @@ Todo 管理规则（严格遵守）:
 
         self._output_buffer += text
 
-        # 缓冲刷新策略
+        # ★ 缓冲刷新策略（优化：提高阈值减少跨线程信号发射）
         should_flush = False
         current_time = time.time()
-        if len(self._output_buffer) >= 15:
+        if len(self._output_buffer) >= 50:         # 50 字符批量刷新（原 15）
             should_flush = True
-        if any(c in text for c in ('。', '！', '？', '\n', '.', '!', '?', '：', ':')):
+        elif '\n' in text:                          # 换行时立即刷新（保证段落及时显示）
             should_flush = True
-        if current_time - self._last_flush_time > 0.1:
+        elif current_time - self._last_flush_time > 0.15:  # 150ms 兜底（原 100ms）
             should_flush = True
 
         if should_flush and self._output_buffer:
@@ -2501,16 +2501,39 @@ Todo 管理规则（严格遵守）:
         
         return " | ".join(parts) if parts else ""
 
-    def _auto_rag_retrieve(self, user_text: str) -> str:
-        """自动 RAG: 从用户消息中提取关键词，检索 Houdini 文档并注入上下文
+    def _auto_rag_retrieve(self, user_text: str,
+                           scene_context: dict = None,
+                           conversation_len: int = 0) -> str:
+        """自动 RAG: 从用户消息 + Houdini 场景上下文检索文档并注入
 
         在后台线程调用，不涉及 Qt 控件。
-        返回空字符串表示无相关文档。
+        
+        Args:
+            user_text: 用户最新消息文本
+            scene_context: 主线程收集的场景上下文 (network_path, selected_types, selected_names)
+            conversation_len: 当前对话历史条数（用于动态调整注入量）
         """
         try:
             from ..utils.doc_rag import get_doc_index
             index = get_doc_index()
-            return index.auto_retrieve(user_text, max_chars=1200)
+            
+            # ★ 动态调整 RAG 注入量：对话越长越精简，避免浪费 token
+            if conversation_len > 20:
+                max_chars = 400   # 长对话：精简注入
+            elif conversation_len > 10:
+                max_chars = 800   # 中等对话
+            else:
+                max_chars = 1200  # 短对话：充分注入
+            
+            # ★ 场景上下文增强：把选中节点类型也加入检索查询
+            enriched_query = user_text
+            if scene_context:
+                selected_types = scene_context.get('selected_types', [])
+                if selected_types:
+                    # 把选中节点的类型名加入查询，让 RAG 检索到相关文档
+                    enriched_query += ' ' + ' '.join(selected_types)
+            
+            return index.auto_retrieve(enriched_query, max_chars=max_chars)
         except Exception:
             return ""
 
@@ -2603,6 +2626,7 @@ Todo 管理规则（严格遵守）:
             'use_agent': self.agent_check.isChecked(),
             'use_think': self.think_check.isChecked(),
             'context_limit': self._get_current_context_limit(),  # 也在主线程获取
+            'scene_context': self._collect_scene_context(),  # ★ 主线程收集 Houdini 场景上下文
         }
         
         # 保存模型选择
@@ -2631,6 +2655,7 @@ Todo 管理规则（严格遵守）:
         use_agent = agent_params['use_agent']
         use_think = agent_params.get('use_think', True)
         context_limit = agent_params['context_limit']
+        scene_context = agent_params.get('scene_context', {})
         
         try:
             # ========================================
@@ -2718,7 +2743,11 @@ Todo 管理规则（严格遵守）:
                             user_last_msg = raw_content
                         break
             if user_last_msg:
-                rag_context = self._auto_rag_retrieve(user_last_msg)
+                rag_context = self._auto_rag_retrieve(
+                    user_last_msg,
+                    scene_context=scene_context,
+                    conversation_len=len(self._conversation_history),
+                )
                 if rag_context:
                     messages.append({'role': 'system', 'content': rag_context})
             
@@ -2981,10 +3010,10 @@ Todo 管理规则（严格遵守）:
         
         # 检查是否是节点操作，需要高亮显示
         # 但如果是失败的操作，也要显示错误信息
-        if name in ('create_node', 'create_nodes_batch', 'create_wrangle_node', 'delete_node'):
+        if name in ('create_node', 'create_nodes_batch', 'create_wrangle_node', 'delete_node', 'set_node_parameter'):
             if result.get('success'):
-                # 成功时使用节点操作标签
-                self._addNodeOperation.emit(name, json.dumps(result))
+                # 成功时使用节点操作标签（直接传 dict，避免 JSON 序列化开销）
+                self._addNodeOperation.emit(name, result)
                 # 同时设置 ToolCallItem 结果（折叠式，可展开查看完整内容）
                 QtCore.QMetaObject.invokeMethod(
                     self, "_add_tool_result_ui",
@@ -3075,16 +3104,14 @@ Todo 管理规则（严格遵守）:
         return [m.group(1)] if m else []
     
     @QtCore.Slot(str, str)
-    def _on_add_node_operation(self, name: str, result_json: str):
+    def _on_add_node_operation(self, name: str, result: dict):
         """处理节点操作高亮显示"""
         try:
             resp = self._agent_response or self._current_response
             if not resp:
                 return
             
-            try:
-                result = json.loads(result_json)
-            except Exception:
+            if not isinstance(result, dict):
                 result = {}
             
             label = None
@@ -3107,6 +3134,26 @@ Todo 管理规则（严格遵守）:
                 op_type = 'delete'
                 paths = self._extract_node_paths(result_text, 'delete_node') or ([result_text] if result_text else [])
                 label = NodeOperationLabel('delete', 1, paths) if paths else None
+            
+            elif name == 'set_node_parameter':
+                op_type = 'modify'
+                # undo_snapshot 包含 node_path, param_name, old_value, new_value
+                if undo_snapshot:
+                    node_path = undo_snapshot.get("node_path", "")
+                    param_name = undo_snapshot.get("param_name", "")
+                    old_val = undo_snapshot.get("old_value", "")
+                    new_val = undo_snapshot.get("new_value", "")
+                    paths = [node_path] if node_path else []
+                    # 传 param_diff 给 NodeOperationLabel，展示红绿 diff
+                    param_diff = {
+                        "param_name": param_name,
+                        "old_value": old_val,
+                        "new_value": new_val,
+                    }
+                    label = NodeOperationLabel('modify', 1, paths, param_diff=param_diff) if paths else None
+                else:
+                    paths = self._extract_node_paths(result_text, 'set_node_parameter') or []
+                    label = NodeOperationLabel('modify', 1, paths) if paths else None
             
             if label:
                 label.nodeClicked.connect(self._navigate_to_node)
@@ -3160,6 +3207,7 @@ Todo 管理规则（严格遵守）:
         
         - create 操作 → 删除该节点（by path）
         - delete 操作 → 从快照重建该节点
+        - modify 操作 → 恢复参数旧值
         """
         try:
             import hou
@@ -3168,7 +3216,41 @@ Todo 管理规则（严格遵守）:
             return
         
         try:
-            if op_type == 'create':
+            if op_type == 'modify' and undo_snapshot:
+                # ---- 撤销参数修改 = 恢复旧值 ----
+                node_path = undo_snapshot.get("node_path", "")
+                param_name = undo_snapshot.get("param_name", "")
+                old_value = undo_snapshot.get("old_value")
+                is_tuple = undo_snapshot.get("is_tuple", False)
+                
+                node = hou.node(node_path)
+                if node is None:
+                    self._show_toast(f"节点不存在: {node_path}")
+                    return
+                
+                if is_tuple:
+                    parm_tuple = node.parmTuple(param_name)
+                    if parm_tuple is None:
+                        self._show_toast(f"参数不存在: {param_name}")
+                        return
+                    parm_tuple.set(old_value)
+                else:
+                    parm = node.parm(param_name)
+                    if parm is None:
+                        self._show_toast(f"参数不存在: {param_name}")
+                        return
+                    if isinstance(old_value, dict) and "expr" in old_value:
+                        lang_str = old_value.get("lang", "Hscript")
+                        lang = (hou.exprLanguage.Python
+                                if "python" in lang_str.lower()
+                                else hou.exprLanguage.Hscript)
+                        parm.setExpression(old_value["expr"], lang)
+                    else:
+                        parm.set(old_value)
+                
+                self._show_toast(f"已恢复参数 {param_name} 为旧值")
+            
+            elif op_type == 'create':
                 # ---- 撤销创建 = 删除节点 ----
                 if not node_paths:
                     self._show_toast("缺少节点路径，无法撤销")
@@ -3654,6 +3736,30 @@ Todo 管理规则（严格遵守）:
             self.node_context_bar.update_context(path, selected)
         except Exception:
             self.node_context_bar.update_context("/obj")
+
+    def _collect_scene_context(self) -> dict:
+        """[主线程] 收集 Houdini 场景上下文用于自动 RAG 增强
+        
+        返回场景上下文 dict，传给后台线程的 _auto_rag_retrieve 使用。
+        包含：当前网络路径、选中节点类型、选中节点名。
+        """
+        ctx = {'network_path': '', 'selected_types': [], 'selected_names': []}
+        try:
+            import hou  # type: ignore
+            # 当前网络路径
+            editors = [p for p in hou.ui.paneTabs()
+                       if p.type() == hou.paneTabType.NetworkEditor]
+            if editors:
+                pwd = editors[0].pwd()
+                if pwd:
+                    ctx['network_path'] = pwd.path()
+            # 选中节点的类型和名称
+            for n in hou.selectedNodes()[:5]:  # 最多 5 个，避免过多
+                ctx['selected_types'].append(n.type().name())
+                ctx['selected_names'].append(n.name())
+        except Exception:
+            pass
+        return ctx
 
     def _on_create_wrangle(self, vex_code: str):
         """从代码块一键创建 Wrangle 节点"""
