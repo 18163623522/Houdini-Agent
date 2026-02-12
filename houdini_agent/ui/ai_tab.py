@@ -69,6 +69,7 @@ class AITab(QtWidgets.QWidget):
         
         # 状态
         self._conversation_history: List[Dict[str, Any]] = []
+        self._pending_ops: list = []  # 追踪未决操作: [(label, op_type, paths, snapshot), ...]
         self._current_response: Optional[AIResponse] = None
         self._is_running = False
         self._thinking_timer: Optional[QtCore.QTimer] = None
@@ -183,6 +184,9 @@ class AITab(QtWidgets.QWidget):
         app = QtWidgets.QApplication.instance()
         if app:
             app.aboutToQuit.connect(self._periodic_save_all)
+        
+        # ★ 启动时静默检查更新（延迟 5 秒，不阻塞初始化）
+        QtCore.QTimer.singleShot(5000, self._silent_update_check)
 
     def _build_system_prompt(self, with_thinking: bool = True) -> str:
         """构建系统提示
@@ -200,28 +204,41 @@ class AITab(QtWidgets.QWidget):
 即使是简短的确认或状态更新，也必须先写 <think> 标签再写正文。
 跳过 <think> 标签等同于格式违规，是不可接受的。
 
-<think> 标签内写出：
-1. 对当前情况/上一步执行结果的分析
-2. 下一步的推理和行动计划
-3. 如果要调用工具，说明为什么调用以及参数选择依据
+深度思考框架（<think> 标签内必须按此框架展开，不可省略步骤）:
+1.【理解】用户真正要什么？有没有字面之外的隐含需求？不要只看表面。
+2.【现状】当前场景是什么状态？上一步工具返回了什么？结果是否符合预期？有没有异常或遗漏？
+3.【方案】列出至少2种可行方案并比较优劣。如果只有唯一方案，说明为什么没有替代。
+4.【决策】选择最优方案，明确说出选择理由。
+5.【计划】列出具体执行步骤、需要调用的工具及其顺序。
+6.【风险】这个方案可能出什么问题？遇到了如何应对？
+
+思考原则:
+-不要急于行动，先充分理解现有网络结构再决定如何修改。
+-如果对节点类型、参数名、连接关系不确定，必须先用查询工具确认，绝不猜测。
+-每次收到工具结果后，先评估结果质量：是否成功？返回值是否合理？不符合预期时分析原因并调整方案。
+-宁可多查一次，不要因为假设错误导致返工。
+-看到第一个可行方案后不要立刻执行，再想一想有没有更优的做法。
 
 标签外的内容是展示给用户的正式回复——简洁、直接、以操作为主。
 
-示例（纯文字回复）:
+示例（深度思考 + 纯文字回复）:
 <think>
-用户需要散点效果。方案：box -> scatter -> copytopoints。
-copytopoints 第0输入=模板几何体，第1输入=目标点。需要一个小球作为复制模板。
+【理解】用户要在地面上撒点并复制小球体。隐含需求：点分布要均匀、球体大小合适。
+【现状】/obj/geo1 下目前为空，需要从头搭建。
+【方案】
+A: box -> scatter -> sphere + copytopoints — 经典流程，scatter 直接控制点数和分布。
+B: grid -> wrangle(用 VEX rand 手动生成点) + copytopoints — 更灵活但更复杂，当前场景不需要。
+【决策】选 A，标准流程且 scatter 参数可控，无需过度工程化。
+【计划】1. create_node box 作为散点基础面 2. create_node scatter 连接 box 3. create_node sphere 作为复制模板 4. create_node copytopoints 连接 scatter(输入1) 和 sphere(输入0) 5. verify_and_summarize 检查
+【风险】copytopoints 输入顺序容易搞反（0=模板,1=目标点），需要仔细确认连接。
 </think>
 已创建 box->scatter->copytopoints 流程，500 个点，球体半径 0.05。
 
-示例（调用工具前）:
-<think>
-用户需要创建地形。步骤：1. 创建 grid 作为基础 2. 添加 noise wrangle 3. 验证网络结构。
-</think>
-
 示例（工具执行后的后续回复，仍然必须有 think 标签）:
 <think>
-上一步创建了 grid 节点，返回路径 /obj/geo1/grid1。接下来添加 noise wrangle。
+【现状】上一步创建了 grid 节点，返回路径 /obj/geo1/grid1，状态正常。
+【计划】接下来添加 wrangle 节点来实现地形噪波位移。代码需要用 @P.y += noise(@P * freq) 结构，run_over 选 Points（操作点属性 @P）。
+【风险】noise 频率和振幅需要合理值，先用 freq=2, amp=0.5 作为默认，用户可以后续调整。
 </think>
 """
         else:
@@ -494,16 +511,11 @@ Todo 管理规则（严格遵守）:
         self.model_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         row1.addWidget(self.model_combo, 1)  # stretch=1 让模型框占满剩余宽度
         
-        # Agent / Web 开关
+        # Web / Think 开关（Agent/Ask 模式已移至输入区域下方）
         _chk_style = f"""
             QCheckBox {{ color: {CursorTheme.TEXT_SECONDARY}; font-size: 12px; }}
             QCheckBox::indicator {{ width: 11px; height: 11px; }}
         """
-        self.agent_check = QtWidgets.QCheckBox("Agent")
-        self.agent_check.setChecked(True)
-        self.agent_check.setStyleSheet(_chk_style)
-        row1.addWidget(self.agent_check)
-        
         self.web_check = QtWidgets.QCheckBox("Web")
         self.web_check.setChecked(True)
         self.web_check.setStyleSheet(_chk_style)
@@ -548,6 +560,27 @@ Todo 管理规则（严格遵守）:
         self.btn_optimize.setStyleSheet(self._small_btn_style())
         self.btn_optimize.setToolTip("Token 优化：自动压缩和优化")
         row2.addWidget(self.btn_optimize)
+        
+        # ★ 更新按钮（黄色醒目）
+        self.btn_update = QtWidgets.QPushButton("Update")
+        self.btn_update.setFixedHeight(24)
+        self.btn_update.setStyleSheet(f"""
+            QPushButton {{
+                background: {CursorTheme.BG_TERTIARY};
+                color: {CursorTheme.ACCENT_YELLOW};
+                border: 1px solid {CursorTheme.ACCENT_YELLOW};
+                border-radius: 3px;
+                font-size: 11px;
+                padding: 2px 6px;
+                min-height: 20px;
+            }}
+            QPushButton:hover {{
+                background: {CursorTheme.ACCENT_YELLOW};
+                color: {CursorTheme.BG_PRIMARY};
+            }}
+        """)
+        self.btn_update.setToolTip("检查并更新到最新版本")
+        row2.addWidget(self.btn_update)
         
         outer.addLayout(row2)
         
@@ -787,6 +820,8 @@ Todo 管理规则（严格遵守）:
         self._context_summary = ''
         self._current_response = None
         self._token_stats = new_token_stats
+        self._pending_ops.clear()
+        self._update_batch_bar()
         self.scroll_area = scroll_area
         self.chat_container = chat_container
         self.chat_layout = chat_layout
@@ -911,6 +946,69 @@ Todo 管理规则（严格遵守）:
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
         
+        # -------- Undo All / Keep All 批量操作栏（默认隐藏）--------
+        self._batch_bar = QtWidgets.QFrame()
+        self._batch_bar.setVisible(False)
+        self._batch_bar.setStyleSheet(f"""
+            QFrame {{
+                background: {CursorTheme.BG_TERTIARY};
+                border: 1px solid {CursorTheme.BORDER};
+                border-radius: 4px;
+            }}
+        """)
+        batch_layout = QtWidgets.QHBoxLayout(self._batch_bar)
+        batch_layout.setContentsMargins(8, 3, 8, 3)
+        batch_layout.setSpacing(6)
+        
+        self._batch_count_label = QtWidgets.QLabel("")
+        self._batch_count_label.setStyleSheet(f"""
+            color: {CursorTheme.TEXT_SECONDARY};
+            font-size: 11px;
+            font-family: {CursorTheme.FONT_CODE};
+        """)
+        batch_layout.addWidget(self._batch_count_label)
+        batch_layout.addStretch()
+        
+        self._btn_undo_all = QtWidgets.QPushButton("Undo All")
+        self._btn_undo_all.setCursor(QtCore.Qt.PointingHandCursor)
+        self._btn_undo_all.setStyleSheet(f"""
+            QPushButton {{
+                color: {CursorTheme.ACCENT_RED};
+                font-size: 11px;
+                font-family: {CursorTheme.FONT_BODY};
+                padding: 2px 10px;
+                border: 1px solid {CursorTheme.ACCENT_RED};
+                border-radius: 3px;
+                background: transparent;
+            }}
+            QPushButton:hover {{
+                background: #3d1f1f;
+            }}
+        """)
+        self._btn_undo_all.clicked.connect(self._undo_all_ops)
+        batch_layout.addWidget(self._btn_undo_all)
+        
+        self._btn_keep_all = QtWidgets.QPushButton("Keep All")
+        self._btn_keep_all.setCursor(QtCore.Qt.PointingHandCursor)
+        self._btn_keep_all.setStyleSheet(f"""
+            QPushButton {{
+                color: {CursorTheme.ACCENT_GREEN};
+                font-size: 11px;
+                font-family: {CursorTheme.FONT_BODY};
+                padding: 2px 10px;
+                border: 1px solid {CursorTheme.ACCENT_GREEN};
+                border-radius: 3px;
+                background: transparent;
+            }}
+            QPushButton:hover {{
+                background: #1f3d1f;
+            }}
+        """)
+        self._btn_keep_all.clicked.connect(self._keep_all_ops)
+        batch_layout.addWidget(self._btn_keep_all)
+        
+        layout.addWidget(self._batch_bar)
+        
         # 图片附件预览区（输入框上方，默认隐藏）
         self._pending_images = []  # List[Tuple[str, str, QPixmap]]  (base64_data, media_type, thumbnail)
         self.image_preview_container = QtWidgets.QWidget()
@@ -998,7 +1096,108 @@ Todo 管理规则（严格遵守）:
         
         layout.addLayout(btn_layout)
         
+        # -------- 模式切换行：Agent / Ask（互斥 radio 风格复选框）--------
+        mode_layout = QtWidgets.QHBoxLayout()
+        mode_layout.setContentsMargins(0, 2, 0, 0)
+        mode_layout.setSpacing(8)
+        
+        self._agent_mode = True  # True=Agent, False=Ask
+        
+        # Agent 复选框 — 灰色圆形指示器
+        self.chk_mode_agent = QtWidgets.QCheckBox("Agent")
+        self.chk_mode_agent.setChecked(True)
+        self.chk_mode_agent.setCursor(QtCore.Qt.PointingHandCursor)
+        self.chk_mode_agent.setToolTip("Agent 模式：AI 可以自主创建、修改、删除节点，执行完整操作")
+        self.chk_mode_agent.setStyleSheet(f"""
+            QCheckBox {{
+                color: {CursorTheme.TEXT_SECONDARY};
+                font-size: 12px;
+                spacing: 4px;
+            }}
+            QCheckBox::indicator {{
+                width: 13px; height: 13px;
+                border-radius: 7px;
+                border: 1.5px solid {CursorTheme.TEXT_MUTED};
+                background: transparent;
+            }}
+            QCheckBox::indicator:checked {{
+                background: {CursorTheme.TEXT_SECONDARY};
+                border-color: {CursorTheme.TEXT_SECONDARY};
+                image: none;
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: {CursorTheme.TEXT_PRIMARY};
+            }}
+        """)
+        self.chk_mode_agent.toggled.connect(self._on_agent_toggled)
+        mode_layout.addWidget(self.chk_mode_agent)
+        
+        # Ask 复选框 — 绿色圆形指示器
+        self.chk_mode_ask = QtWidgets.QCheckBox("Ask")
+        self.chk_mode_ask.setChecked(False)
+        self.chk_mode_ask.setCursor(QtCore.Qt.PointingHandCursor)
+        self.chk_mode_ask.setToolTip("Ask 模式：AI 只能查询和分析，不会修改场景（只读）")
+        self.chk_mode_ask.setStyleSheet(f"""
+            QCheckBox {{
+                color: {CursorTheme.TEXT_SECONDARY};
+                font-size: 12px;
+                spacing: 4px;
+            }}
+            QCheckBox::indicator {{
+                width: 13px; height: 13px;
+                border-radius: 7px;
+                border: 1.5px solid {CursorTheme.TEXT_MUTED};
+                background: transparent;
+            }}
+            QCheckBox::indicator:checked {{
+                background: {CursorTheme.ACCENT_GREEN};
+                border-color: {CursorTheme.ACCENT_GREEN};
+                image: none;
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: {CursorTheme.ACCENT_GREEN};
+            }}
+        """)
+        self.chk_mode_ask.toggled.connect(self._on_ask_toggled)
+        mode_layout.addWidget(self.chk_mode_ask)
+        
+        mode_layout.addStretch()
+        layout.addLayout(mode_layout)
+        
         return container
+
+    # ---------- Agent / Ask 模式互斥切换 ----------
+
+    def _on_agent_toggled(self, checked: bool):
+        """Agent 复选框状态改变"""
+        if self._agent_mode == checked:
+            # 防止取消勾选自己（至少保持一个选中）
+            if not checked:
+                self.chk_mode_agent.blockSignals(True)
+                self.chk_mode_agent.setChecked(True)
+                self.chk_mode_agent.blockSignals(False)
+            return
+        self._agent_mode = checked
+        # 互斥：勾选 Agent → 取消 Ask
+        self.chk_mode_ask.blockSignals(True)
+        self.chk_mode_ask.setChecked(not checked)
+        self.chk_mode_ask.blockSignals(False)
+
+    def _on_ask_toggled(self, checked: bool):
+        """Ask 复选框状态改变"""
+        is_agent = not checked
+        if self._agent_mode == is_agent:
+            # 防止取消勾选自己
+            if not checked:
+                self.chk_mode_ask.blockSignals(True)
+                self.chk_mode_ask.setChecked(True)
+                self.chk_mode_ask.blockSignals(False)
+            return
+        self._agent_mode = is_agent
+        # 互斥：勾选 Ask → 取消 Agent
+        self.chk_mode_agent.blockSignals(True)
+        self.chk_mode_agent.setChecked(not checked)
+        self.chk_mode_agent.blockSignals(False)
 
     def _combo_style(self) -> str:
         return f"""
@@ -1048,6 +1247,7 @@ Todo 管理规则（严格遵守）:
         self.btn_selection.clicked.connect(self._on_read_selection)
         self.btn_export_train.clicked.connect(self._on_export_training_data)
         self.btn_attach_image.clicked.connect(self._on_attach_image)
+        self.btn_update.clicked.connect(self._on_check_update)
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         self.model_combo.currentIndexChanged.connect(self._update_context_stats)
         # 切换提供商或模型或 Think 时自动保存偏好
@@ -1972,12 +2172,44 @@ Todo 管理规则（严格遵守）:
         'update_todo',
     })
 
+    # ★ Ask 模式白名单：只读 / 查询 / 分析工具（不包含任何修改场景的操作）
+    _ASK_MODE_TOOLS = frozenset({
+        # 查询 & 检查
+        'get_network_structure',
+        'get_node_parameters',
+        'list_children',
+        'read_selection',
+        'search_node_types',
+        'semantic_search_nodes',
+        'find_nodes_by_param',
+        'get_node_inputs',
+        'check_errors',
+        'verify_and_summarize',
+        # 文档 & 搜索
+        'web_search',
+        'fetch_webpage',
+        'search_local_doc',
+        'get_houdini_node_doc',
+        # Skill（只读查看）
+        'list_skills',
+        # 任务管理
+        'add_todo',
+        'update_todo',
+    })
+
     def _execute_tool_with_todo(self, tool_name: str, **kwargs) -> dict:
         """执行工具，包含 Todo 相关的工具
         
         注意：此方法在后台线程调用，Houdini 操作必须通过信号调度到主线程执行。
         不依赖 hou 模块的工具（execute_shell 等）直接在后台线程执行，避免阻塞 UI。
         """
+        # ★ Ask 模式安全守卫：拦截任何不在白名单的工具
+        if not self._agent_mode and tool_name not in self._ASK_MODE_TOOLS:
+            return {
+                "success": False,
+                "error": f"[Ask 模式] 工具 '{tool_name}' 不可用。当前为只读模式，无法执行修改操作。请切换到 Agent 模式。"
+            }
+        
         # 处理 Todo 相关工具（纯 Python 操作，线程安全）
         if tool_name == "add_todo":
             todo_id = kwargs.get("todo_id", "")
@@ -2623,7 +2855,7 @@ Todo 管理规则（严格遵守）:
             'provider': self._current_provider(),
             'model': self.model_combo.currentText(),
             'use_web': self.web_check.isChecked(),
-            'use_agent': self.agent_check.isChecked(),
+            'use_agent': self._agent_mode,  # True=Agent(full), False=Ask(read-only)
             'use_think': self.think_check.isChecked(),
             'context_limit': self._get_current_context_limit(),  # 也在主线程获取
             'scene_context': self._collect_scene_context(),  # ★ 主线程收集 Houdini 场景上下文
@@ -2666,6 +2898,26 @@ Todo 管理规则（严格遵守）:
             
             # 1. 系统提示词（根据思考模式选择版本）
             sys_prompt = self._cached_prompt_think if use_think else self._cached_prompt_no_think
+            
+            # ★ Ask 模式：追加只读约束
+            if not use_agent:
+                ask_constraint = (
+                    "\n\n【当前为 Ask 模式（只读）】\n"
+                    "你只能查询、分析和回答问题。严禁执行以下操作：\n"
+                    "- 创建节点（create_node, create_wrangle_node, create_nodes_batch, copy_node）\n"
+                    "- 删除节点（delete_node）\n"
+                    "- 修改参数（set_node_parameter, batch_set_parameters）\n"
+                    "- 修改连接（connect_nodes）\n"
+                    "- 修改显示（set_display_flag）\n"
+                    "- 保存文件（save_hip）\n"
+                    "- 撤销/重做（undo_redo）\n"
+                    "如果用户请求修改操作，请礼貌说明当前处于 Ask（只读）模式，"
+                    "建议用户切换到 Agent 模式来执行修改。\n"
+                    "你可以使用查询工具（如 get_network_structure, get_node_parameters, "
+                    "read_selection 等）来分析场景并提供建议。"
+                )
+                sys_prompt = sys_prompt + ask_constraint
+            
             messages = [{'role': 'system', 'content': sys_prompt}]
             
             # ================================================================
@@ -2872,7 +3124,15 @@ Todo 管理规则（严格遵守）:
             messages = cleaned_messages
             
             # 使用缓存的优化后工具定义（只计算一次）
-            if use_web:
+            if not use_agent:
+                # ★ Ask 模式：只保留只读/查询工具
+                ask_filtered = [t for t in HOUDINI_TOOLS
+                                if t['function']['name'] in self._ASK_MODE_TOOLS]
+                if not use_web:
+                    ask_filtered = [t for t in ask_filtered
+                                    if t['function']['name'] not in ('web_search', 'fetch_webpage')]
+                tools = UltraOptimizer.optimize_tool_definitions(ask_filtered)
+            elif use_web:
                 if self._cached_optimized_tools is None:
                     self._cached_optimized_tools = UltraOptimizer.optimize_tool_definitions(HOUDINI_TOOLS)
                 tools = self._cached_optimized_tools
@@ -2883,6 +3143,7 @@ Todo 管理规则（严格遵守）:
                 tools = self._cached_optimized_tools_no_web
             
             if use_agent:
+                # ★ Agent 模式：完整 agent loop，可创建/修改/删除节点
                 result = self.client.agent_loop_auto(
                     messages=messages,
                     model=model,
@@ -2890,6 +3151,26 @@ Todo 管理规则（严格遵守）:
                     max_iterations=999,  # 不限制迭代次数
                     max_tokens=None,  # 不限制输出长度
                     enable_thinking=use_think,
+                    tools_override=tools,
+                    on_content=lambda c: self._on_content_with_limit(c),
+                    on_thinking=lambda t: self._on_thinking_chunk(t),
+                    on_tool_call=lambda n, a: (
+                        self._addStatus.emit(f"[tool]{n}") if n not in self._SILENT_TOOLS else None
+                    ),
+                    on_tool_result=lambda n, a, r: (
+                        self._add_tool_result(n, r, a) if n not in self._SILENT_TOOLS else None
+                    )
+                )
+            elif tools:
+                # ★ Ask 模式：仍用 agent loop 但只提供只读工具
+                result = self.client.agent_loop_auto(
+                    messages=messages,
+                    model=model,
+                    provider=provider,
+                    max_iterations=15,  # Ask 模式限制迭代（主要是查询）
+                    max_tokens=None,
+                    enable_thinking=use_think,
+                    tools_override=tools,  # ★ 只传入只读工具
                     on_content=lambda c: self._on_content_with_limit(c),
                     on_thinking=lambda t: self._on_thinking_chunk(t),
                     on_tool_call=lambda n, a: (
@@ -2900,7 +3181,7 @@ Todo 管理规则（严格遵守）:
                     )
                 )
             else:
-                # 非 Agent 模式也要限制输出 + 解析 <think> 标签
+                # 无工具的纯对话模式（fallback）
                 result = {'ok': True, 'content': '', 'tool_calls_history': [], 'iterations': 1, 'usage': {}}
                 for chunk in self.client.chat_stream(
                     messages=messages, 
@@ -3163,6 +3444,12 @@ Todo 管理规则（严格遵守）:
                         self._undo_node_operation(_op, _paths, _snap)
                 )
                 resp.details_layout.addWidget(label)
+                
+                # ★ 追踪未决操作 → Undo All / Keep All 按钮可见
+                entry = (label, op_type, list(paths), undo_snapshot)
+                self._pending_ops.append(entry)
+                label.decided.connect(self._update_batch_bar)
+                self._update_batch_bar()
             
             self._scroll_agent_to_bottom()
         except RuntimeError:
@@ -3341,6 +3628,70 @@ Todo 管理规则（严格遵守）:
         
         except Exception as e:
             self._show_toast(f"撤销失败: {e}")
+
+    # ---------- Undo All / Keep All 批量操作 ----------
+
+    def _update_batch_bar(self):
+        """根据未决操作数量显示/隐藏批量操作栏"""
+        # 清理已决的条目（label._decided == True）
+        self._pending_ops = [
+            entry for entry in self._pending_ops
+            if entry[0] and not entry[0]._decided
+        ]
+        count = len(self._pending_ops)
+        if count > 0:
+            self._batch_count_label.setText(f"{count} 个操作待确认")
+            self._batch_bar.setVisible(True)
+        else:
+            self._batch_bar.setVisible(False)
+
+    def _undo_all_ops(self):
+        """撤销所有未决操作（倒序执行，后创建的先撤销）"""
+        # 清理已决条目
+        self._pending_ops = [
+            entry for entry in self._pending_ops
+            if entry[0] and not entry[0]._decided
+        ]
+        if not self._pending_ops:
+            self._batch_bar.setVisible(False)
+            return
+        
+        count = 0
+        # 倒序：后创建的先撤销（避免依赖冲突）
+        for label, op_type, paths, snapshot in reversed(self._pending_ops):
+            if label._decided:
+                continue
+            # 触发单条撤销
+            label._on_undo()
+            self._undo_node_operation(op_type, paths, snapshot)
+            count += 1
+        
+        self._pending_ops.clear()
+        self._batch_bar.setVisible(False)
+        if count:
+            self._show_toast(f"已撤销全部 {count} 个操作")
+
+    def _keep_all_ops(self):
+        """保留所有未决操作"""
+        self._pending_ops = [
+            entry for entry in self._pending_ops
+            if entry[0] and not entry[0]._decided
+        ]
+        if not self._pending_ops:
+            self._batch_bar.setVisible(False)
+            return
+        
+        count = 0
+        for label, op_type, paths, snapshot in self._pending_ops:
+            if label._decided:
+                continue
+            label._on_keep()
+            count += 1
+        
+        self._pending_ops.clear()
+        self._batch_bar.setVisible(False)
+        if count:
+            self._show_toast(f"已保留全部 {count} 个操作")
 
     @QtCore.Slot(str, str)
     def _on_add_python_shell(self, code: str, result_json: str):
@@ -5198,4 +5549,244 @@ Todo 管理规则（严格遵守）:
             )
         else:
             QtWidgets.QMessageBox.information(self, "提示", "无需优化，对话历史已经很精简")
+
+    # ============================================================
+    # 自动更新
+    # ============================================================
+
+    _updateCheckDone = QtCore.Signal(dict)   # 检查结果
+    _updateApplyDone = QtCore.Signal(dict)   # 应用结果
+    _updateProgress = QtCore.Signal(str, int)  # (stage, percent)
+
+    def _silent_update_check(self):
+        """启动时静默检查更新（不弹窗，只在有更新时高亮按钮）"""
+        try:
+            self._updateCheckDone.connect(self._on_silent_check_result, QtCore.Qt.UniqueConnection)
+        except RuntimeError:
+            pass
+        threading.Thread(target=self._bg_check_update, daemon=True).start()
+
+    @QtCore.Slot(dict)
+    def _on_silent_check_result(self, result: dict):
+        """[主线程] 静默检查结果 → 如果有更新，高亮 Update 按钮"""
+        # 断开静默回调，防止和手动点击冲突
+        try:
+            self._updateCheckDone.disconnect(self._on_silent_check_result)
+        except RuntimeError:
+            pass
+        
+        if result.get('has_update') and result.get('remote_version'):
+            remote_ver = result['remote_version']
+            # 用醒目样式标记按钮
+            self.btn_update.setText(f"🔄 v{remote_ver}")
+            self.btn_update.setToolTip(f"发现新版本 v{remote_ver}，点击更新")
+            self.btn_update.setStyleSheet(f"""
+                QPushButton {{
+                    background: {CursorTheme.ACCENT_GREEN};
+                    color: {CursorTheme.BG_PRIMARY};
+                    border: 1px solid {CursorTheme.ACCENT_GREEN};
+                    border-radius: 3px;
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 2px 6px;
+                    min-height: 20px;
+                }}
+                QPushButton:hover {{
+                    background: #5fd9c0;
+                    color: {CursorTheme.BG_PRIMARY};
+                }}
+            """)
+            # 保存检查结果，供手动点击时直接使用
+            self._cached_update_result = result
+
+    def _on_check_update(self):
+        """点击 Update 按钮 → 后台检查更新（如果有缓存结果直接使用）"""
+        # 如果启动时已检测到新版本，直接显示结果
+        cached = getattr(self, '_cached_update_result', None)
+        if cached and cached.get('has_update'):
+            self._on_update_check_result(cached)
+            self._cached_update_result = None  # 用完清除
+            return
+        
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("检查中…")
+        
+        # 连接信号（只连一次，用 UniqueConnection 防重复）
+        try:
+            self._updateCheckDone.connect(self._on_update_check_result, QtCore.Qt.UniqueConnection)
+        except RuntimeError:
+            pass
+        
+        threading.Thread(target=self._bg_check_update, daemon=True).start()
+
+    def _bg_check_update(self):
+        """[后台线程] 调用 updater.check_update"""
+        try:
+            from ..utils.updater import check_update
+            result = check_update()
+        except Exception as e:
+            result = {'has_update': False, 'error': str(e), 'local_version': '?', 'remote_version': ''}
+        self._updateCheckDone.emit(result)
+
+    @QtCore.Slot(dict)
+    def _on_update_check_result(self, result: dict):
+        """[主线程] 处理检查结果"""
+        self.btn_update.setEnabled(True)
+        self.btn_update.setText("Update")
+        self.btn_update.setStyleSheet(self._small_btn_style())  # 恢复默认样式
+        
+        if result.get('error'):
+            QtWidgets.QMessageBox.warning(self, "检查更新", f"检查更新失败:\n{result['error']}")
+            return
+        
+        local_ver = result.get('local_version', '?')
+        remote_ver = result.get('remote_version', '?')
+        commit_msg = result.get('commit_message', '')
+        commit_sha = result.get('remote_commit', '')
+        
+        if not result.get('has_update'):
+            QtWidgets.QMessageBox.information(
+                self, "检查更新",
+                f"当前已是最新版本 ✓\n\n"
+                f"本地版本: v{local_ver}\n"
+                f"远程版本: v{remote_ver}"
+            )
+            return
+        
+        # ---- 有新版本，弹出确认对话框 ----
+        detail = f"本地版本: v{local_ver}\n远程版本: v{remote_ver}"
+        if commit_sha:
+            detail += f"\n最新提交: {commit_sha}"
+        if commit_msg:
+            detail += f"\n提交信息: {commit_msg}"
+        detail += "\n\n⚠️ 更新后插件窗口将自动重启。\n（config、cache、trainData 目录不会被覆盖）"
+        
+        reply = QtWidgets.QMessageBox.question(
+            self, "发现新版本",
+            f"发现新版本 v{remote_ver}，是否立即更新？\n\n{detail}",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        
+        if reply == QtWidgets.QMessageBox.Yes:
+            self._start_update()
+
+    def _start_update(self):
+        """开始下载并应用更新"""
+        # 创建进度对话框
+        self._update_progress_dlg = QtWidgets.QProgressDialog(
+            "正在下载更新…", "取消", 0, 100, self
+        )
+        self._update_progress_dlg.setWindowTitle("更新 Houdini Agent")
+        self._update_progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        self._update_progress_dlg.setAutoClose(False)
+        self._update_progress_dlg.setAutoReset(False)
+        self._update_progress_dlg.setMinimumDuration(0)
+        self._update_progress_dlg.setValue(0)
+        self._update_progress_dlg.setStyleSheet(f"""
+            QProgressDialog {{
+                background: {CursorTheme.BG_SECONDARY};
+                color: {CursorTheme.TEXT_PRIMARY};
+                font-family: {CursorTheme.FONT_BODY};
+            }}
+            QProgressBar {{
+                background: {CursorTheme.BG_TERTIARY};
+                border: 1px solid {CursorTheme.BORDER};
+                border-radius: 4px;
+                text-align: center;
+                color: {CursorTheme.TEXT_PRIMARY};
+            }}
+            QProgressBar::chunk {{
+                background: {CursorTheme.ACCENT_GREEN};
+                border-radius: 3px;
+            }}
+        """)
+        
+        # 连接信号
+        try:
+            self._updateProgress.connect(self._on_update_progress, QtCore.Qt.UniqueConnection)
+            self._updateApplyDone.connect(self._on_update_apply_result, QtCore.Qt.UniqueConnection)
+        except RuntimeError:
+            pass
+        
+        threading.Thread(target=self._bg_download_and_apply, daemon=True).start()
+
+    def _bg_download_and_apply(self):
+        """[后台线程] 下载并应用更新"""
+        try:
+            from ..utils.updater import download_and_apply
+            result = download_and_apply(progress_callback=self._update_progress_cb)
+        except Exception as e:
+            result = {'success': False, 'error': str(e), 'updated_files': 0}
+        self._updateApplyDone.emit(result)
+
+    def _update_progress_cb(self, stage: str, percent: int):
+        """进度回调（从后台线程调用 → 通过信号到主线程）"""
+        self._updateProgress.emit(stage, percent)
+
+    @QtCore.Slot(str, int)
+    def _on_update_progress(self, stage: str, percent: int):
+        """[主线程] 更新进度条"""
+        if not hasattr(self, '_update_progress_dlg') or self._update_progress_dlg is None:
+            return
+        
+        stage_labels = {
+            'downloading': '正在下载…',
+            'extracting': '正在解压…',
+            'applying': '正在更新文件…',
+            'done': '更新完成！',
+        }
+        label = stage_labels.get(stage, stage)
+        self._update_progress_dlg.setLabelText(f"{label} ({percent}%)")
+        self._update_progress_dlg.setValue(percent)
+
+    @QtCore.Slot(dict)
+    def _on_update_apply_result(self, result: dict):
+        """[主线程] 更新完成后的处理"""
+        # 关闭进度条
+        if hasattr(self, '_update_progress_dlg') and self._update_progress_dlg:
+            self._update_progress_dlg.close()
+            self._update_progress_dlg = None
+        
+        if not result.get('success'):
+            QtWidgets.QMessageBox.critical(
+                self, "更新失败",
+                f"更新过程中出现错误:\n{result.get('error', '未知错误')}"
+            )
+            return
+        
+        updated = result.get('updated_files', 0)
+        
+        # 更新成功 → 提示并重启
+        reply = QtWidgets.QMessageBox.information(
+            self, "更新成功",
+            f"已成功更新 {updated} 个文件！\n\n点击 OK 立即重启插件。",
+            QtWidgets.QMessageBox.Ok,
+        )
+        
+        # 延迟重启（让对话框关闭后再执行）
+        QtCore.QTimer.singleShot(200, self._do_restart)
+
+    def _do_restart(self):
+        """执行插件重启"""
+        try:
+            # 先保存当前工作区
+            main_win = self.window()
+            if hasattr(main_win, '_save_workspace'):
+                main_win._save_workspace()
+            
+            # 关闭当前窗口
+            main_win.force_quit = True
+            main_win.close()
+            
+            # 延迟重新打开（让窗口完全关闭后再重建）
+            # 注意：使用绝对导入的函数引用，避免模块被清除后相对导入失败
+            from houdini_agent.utils.updater import restart_plugin as _restart_fn
+            QtCore.QTimer.singleShot(500, _restart_fn)
+        except Exception as e:
+            print(f"[Updater] Restart error: {e}")
+            QtWidgets.QMessageBox.warning(
+                self, "重启失败",
+                f"自动重启失败，请手动关闭并重新打开插件。\n\n错误: {e}"
+            )
     

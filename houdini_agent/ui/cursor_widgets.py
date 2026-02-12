@@ -1071,6 +1071,7 @@ class NodeOperationLabel(QtWidgets.QWidget):
     
     nodeClicked = QtCore.Signal(str)      # 发送节点路径（点击节点名跳转）
     undoRequested = QtCore.Signal()       # 请求撤销此操作
+    decided = QtCore.Signal()             # undo 或 keep 完成后通知（用于更新批量操作栏）
     
     _BTN_STYLE = f"""
         QPushButton {{{{
@@ -1323,6 +1324,7 @@ class NodeOperationLabel(QtWidgets.QWidget):
         """)
         self._status_label.setVisible(True)
         self.undoRequested.emit()
+        self.decided.emit()
     
     def _on_keep(self):
         if self._decided:
@@ -1332,6 +1334,7 @@ class NodeOperationLabel(QtWidgets.QWidget):
         self._keep_btn.setVisible(False)
         self._status_label.setText("已保留")
         self._status_label.setVisible(True)
+        self.decided.emit()
 
 
 # ============================================================
@@ -1354,9 +1357,17 @@ class ParamDiffWidget(QtWidgets.QWidget):
     _GREEN_TEXT = "#89d185"   # 新增行文字
     _GREY_TEXT = "#6a6a6a"    # 上下文行文字
     
+    # 行级通用样式（紧凑无间隙，像一个完整代码块）
+    _LINE_BASE = (
+        "font-size: 11px; font-family: {font}; "
+        "margin: 0px; padding: 0px 6px; "
+        "border: none; border-radius: 0px; "
+        "min-height: 16px; max-height: 16px;"
+    )
+
     def __init__(self, param_name: str, old_value, new_value, parent=None):
         super().__init__(parent)
-        self._collapsed = True
+        self._collapsed = False  # ★ 默认展开
         
         old_str = self._to_str(old_value)
         new_str = self._to_str(new_value)
@@ -1365,13 +1376,13 @@ class ParamDiffWidget(QtWidgets.QWidget):
         
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(0, 2, 0, 2)
-        root_layout.setSpacing(2)
+        root_layout.setSpacing(0)
         
         if is_multiline:
             # ── 多行 diff (VEX 等) ──
-            # 标题行: param_name ▶
+            # 标题行: param_name ▼ （默认展开，可手动折叠）
             self._title_text = param_name
-            self._toggle_btn = QtWidgets.QPushButton(f"▶ {param_name}")
+            self._toggle_btn = QtWidgets.QPushButton(f"▼ {param_name}")
             self._toggle_btn.setFlat(True)
             self._toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
             self._toggle_btn.setStyleSheet(f"""
@@ -1391,18 +1402,20 @@ class ParamDiffWidget(QtWidgets.QWidget):
             self._toggle_btn.clicked.connect(self._toggle)
             root_layout.addWidget(self._toggle_btn)
             
-            # diff 内容区（默认折叠）
+            # diff 内容区（默认展开）
             self._diff_frame = QtWidgets.QFrame()
             self._diff_frame.setStyleSheet(f"""
                 QFrame {{
                     background: {CursorTheme.BG_PRIMARY};
                     border: 1px solid {CursorTheme.BORDER};
-                    border-radius: 4px;
+                    border-radius: 3px;
                 }}
             """)
             diff_layout = QtWidgets.QVBoxLayout(self._diff_frame)
-            diff_layout.setContentsMargins(6, 4, 6, 4)
+            diff_layout.setContentsMargins(0, 2, 0, 2)
             diff_layout.setSpacing(0)
+            
+            _font = CursorTheme.FONT_CODE
             
             # 使用 difflib 计算行级 diff
             import difflib
@@ -1421,49 +1434,39 @@ class ParamDiffWidget(QtWidgets.QWidget):
                 for line in diff_body:
                     line_stripped = line.rstrip('\n')
                     if line.startswith('@@'):
-                        # 段落头
                         lbl = QtWidgets.QLabel(line_stripped)
-                        lbl.setStyleSheet(f"""
-                            color: {CursorTheme.ACCENT_PURPLE};
-                            font-size: 11px;
-                            font-family: {CursorTheme.FONT_CODE};
-                            padding: 1px 4px;
-                        """)
+                        lbl.setStyleSheet(
+                            f"color: {CursorTheme.ACCENT_PURPLE}; "
+                            f"background: {CursorTheme.BG_TERTIARY}; "
+                            + self._LINE_BASE.format(font=_font)
+                        )
                         diff_layout.addWidget(lbl)
                     elif line.startswith('-'):
                         lbl = QtWidgets.QLabel(line_stripped)
-                        lbl.setStyleSheet(f"""
-                            color: {self._RED_TEXT};
-                            background: {self._RED_BG};
-                            border-left: 3px solid {self._RED_BORDER};
-                            font-size: 11px;
-                            font-family: {CursorTheme.FONT_CODE};
-                            padding: 1px 4px;
-                        """)
+                        lbl.setStyleSheet(
+                            f"color: {self._RED_TEXT}; "
+                            f"background: {self._RED_BG}; "
+                            + self._LINE_BASE.format(font=_font)
+                        )
                         diff_layout.addWidget(lbl)
                     elif line.startswith('+'):
                         lbl = QtWidgets.QLabel(line_stripped)
-                        lbl.setStyleSheet(f"""
-                            color: {self._GREEN_TEXT};
-                            background: {self._GREEN_BG};
-                            border-left: 3px solid {self._GREEN_BORDER};
-                            font-size: 11px;
-                            font-family: {CursorTheme.FONT_CODE};
-                            padding: 1px 4px;
-                        """)
+                        lbl.setStyleSheet(
+                            f"color: {self._GREEN_TEXT}; "
+                            f"background: {self._GREEN_BG}; "
+                            + self._LINE_BASE.format(font=_font)
+                        )
                         diff_layout.addWidget(lbl)
                     else:
-                        # 上下文行
                         lbl = QtWidgets.QLabel(line_stripped)
-                        lbl.setStyleSheet(f"""
-                            color: {self._GREY_TEXT};
-                            font-size: 11px;
-                            font-family: {CursorTheme.FONT_CODE};
-                            padding: 1px 4px;
-                        """)
+                        lbl.setStyleSheet(
+                            f"color: {self._GREY_TEXT}; "
+                            f"background: {CursorTheme.BG_PRIMARY}; "
+                            + self._LINE_BASE.format(font=_font)
+                        )
                         diff_layout.addWidget(lbl)
             
-            self._diff_frame.setVisible(False)
+            self._diff_frame.setVisible(True)  # ★ 默认展开
             root_layout.addWidget(self._diff_frame)
         else:
             # ── 内联 diff (标量) ──
@@ -1531,20 +1534,22 @@ class ParamDiffWidget(QtWidgets.QWidget):
     def _add_block(self, parent_layout, title: str, text: str, is_old: bool):
         """添加旧值/新值整块（用于 difflib 无差异时的 fallback）"""
         if is_old:
-            bg, border, fg = self._RED_BG, self._RED_BORDER, self._RED_TEXT
+            bg, fg = self._RED_BG, self._RED_TEXT
         else:
-            bg, border, fg = self._GREEN_BG, self._GREEN_BORDER, self._GREEN_TEXT
+            bg, fg = self._GREEN_BG, self._GREEN_TEXT
+        _font = CursorTheme.FONT_CODE
         header = QtWidgets.QLabel(title)
-        header.setStyleSheet(f"color: {fg}; font-size: 10px; font-family: {CursorTheme.FONT_CODE}; padding: 2px 4px;")
+        header.setStyleSheet(
+            f"color: {fg}; background: {CursorTheme.BG_TERTIARY}; "
+            + self._LINE_BASE.format(font=_font)
+        )
         parent_layout.addWidget(header)
         for line in text.splitlines():
             lbl = QtWidgets.QLabel(line)
-            lbl.setStyleSheet(f"""
-                color: {fg}; background: {bg};
-                border-left: 3px solid {border};
-                font-size: 11px; font-family: {CursorTheme.FONT_CODE};
-                padding: 1px 4px;
-            """)
+            lbl.setStyleSheet(
+                f"color: {fg}; background: {bg}; "
+                + self._LINE_BASE.format(font=_font)
+            )
             parent_layout.addWidget(lbl)
     
     @staticmethod

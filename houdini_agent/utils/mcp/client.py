@@ -2309,7 +2309,11 @@ class HoudiniMCP:
         ok, msg, snapshot = self.set_parameter(node_path, param_name, value)
         result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
         if ok and snapshot:
-            result["_undo_snapshot"] = snapshot  # 供 UI 撤销使用，不会发给 AI
+            # ★ 参数前后值一致时不生成 checkpoint，避免显示无意义的"修改"
+            old_v = snapshot.get("old_value")
+            new_v = snapshot.get("new_value")
+            if old_v != new_v:
+                result["_undo_snapshot"] = snapshot  # 供 UI 撤销使用，不会发给 AI
         return result
 
     def _tool_create_node(self, args: Dict[str, Any]) -> Dict[str, Any]:

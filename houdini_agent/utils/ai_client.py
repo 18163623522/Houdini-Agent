@@ -2247,6 +2247,7 @@ class AIClient:
                           temperature: float = 0.3,
                           max_tokens: Optional[int] = None,
                           enable_thinking: bool = True,
+                          tools_override: Optional[List[dict]] = None,
                           on_content: Optional[Callable[[str], None]] = None,
                           on_thinking: Optional[Callable[[str], None]] = None,
                           on_tool_call: Optional[Callable[[str, dict], None]] = None,
@@ -2273,6 +2274,9 @@ class AIClient:
         call_records = []  # 每次 API 调用的详细记录（对齐 Cursor）
         full_content = ""
         iteration = 0
+        
+        # ★ 工具列表：支持外部覆盖（用于 Ask 模式等场景）
+        effective_tools = tools_override if tools_override is not None else HOUDINI_TOOLS
         
         # 累积 usage 统计（用于 cache 命中率统计）
         total_usage = {
@@ -2353,7 +2357,7 @@ class AIClient:
                 provider=provider,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                tools=HOUDINI_TOOLS,
+                tools=effective_tools,
                 tool_choice='auto',
                 enable_thinking=enable_thinking
             ):
@@ -2926,11 +2930,11 @@ class AIClient:
         # 其他云端模型都支持
         return True
     
-    def _get_json_mode_system_prompt(self) -> str:
+    def _get_json_mode_system_prompt(self, tools_list: Optional[List[dict]] = None) -> str:
         """获取 JSON 模式的系统提示（执行器模式）"""
         # 构建工具列表说明
         tool_descriptions = []
-        for tool in HOUDINI_TOOLS:
+        for tool in (tools_list or HOUDINI_TOOLS):
             func = tool['function']
             params = func.get('parameters', {}).get('properties', {})
             required = func.get('parameters', {}).get('required', [])
@@ -3062,6 +3066,7 @@ class AIClient:
                               temperature: float = 0.3,
                               max_tokens: Optional[int] = None,
                               enable_thinking: bool = True,
+                              tools_override: Optional[List[dict]] = None,
                               on_content: Optional[Callable[[str], None]] = None,
                               on_thinking: Optional[Callable[[str], None]] = None,
                               on_tool_call: Optional[Callable[[str, dict], None]] = None,
@@ -3071,8 +3076,11 @@ class AIClient:
         if not self._tool_executor:
             return {'ok': False, 'error': '未设置工具执行器', 'content': '', 'tool_calls_history': [], 'iterations': 0}
         
+        # ★ 工具列表：支持外部覆盖（用于 Ask 模式等场景）
+        effective_tools = tools_override if tools_override is not None else HOUDINI_TOOLS
+        
         # 添加 JSON 模式系统提示
-        json_system_prompt = self._get_json_mode_system_prompt()
+        json_system_prompt = self._get_json_mode_system_prompt(effective_tools)
         working_messages = []
         
         # 处理消息，在第一个 system 消息后追加 JSON 模式说明
