@@ -250,6 +250,13 @@ class AITab(
 -宁可多查一次，不要因为假设错误导致返工。
 -看到第一个可行方案后不要立刻执行，再想一想有没有更优的做法。
 
+遇到障碍时的协作规则（极其重要，禁止放弃方案）:
+-当执行过程中遇到你无法通过工具完成的步骤时（如需要用户手动操作界面、需要用户提供文件/路径/密码、需要安装插件或配置环境、需要用户在视口中选择对象等），**绝对不能直接放弃当前方案或跳过该步骤**。
+-正确做法: 暂停执行，清楚地告诉用户当前进度、遇到了什么障碍、需要用户做什么操作，然后等待用户完成后再继续。
+-说明时要具体: 告诉用户具体的操作步骤（如"请在 Houdini 中安装 SideFX Labs 工具集: 工具架 -> 右键 -> Shelves -> SideFX Labs"），不要只说"请配置好环境"这种模糊指令。
+-如果某个步骤用户可以轻松完成（如拖拽文件、点击按钮、在视口中选择对象），优先请用户操作，而不是绕一大圈用代码模拟。
+-暂停等待时，先把你已经完成的部分总结清楚，再说明下一步需要用户做什么，这样用户完成后你可以无缝继续。
+
 标签外的内容是展示给用户的正式回复——简洁、直接、以操作为主。
 
 示例（深度思考 + 纯文字回复）:
@@ -371,6 +378,18 @@ Skill 系统（几何分析必须优先使用）:
 -示例: run_skill(skill_name="get_bounding_info", params={"node_path": "/obj/geo1/box1"}) 获取边界盒
 -示例: run_skill(skill_name="analyze_normals", params={"node_path": "/obj/geo1/box1"}) 检测法线质量
 
+性能分析与优化（当用户提出性能/速度/卡顿/优化相关需求时使用）:
+-快速诊断: 先用 run_skill(skill_name="analyze_cook_performance", params={"network_path": "/obj/geo1"}) 获取全网络 cook 时间排名和瓶颈识别
+-详细分析: 如需更精确的时间分解和内存统计，用 perf_start_profile 启动 profiling（可同时强制 cook），然后 perf_stop_and_report 获取详细报告
+-分析后根据报告中的瓶颈节点和建议，使用现有工具实施优化，然后再次运行分析验证效果
+-常见优化手段:
+  1.在耗时节点前后添加 Cache/File Cache 节点，避免重复 cook
+  2.减少不必要的 cook（检查 time dependent 表达式）
+  3.用 VEX（create_wrangle_node）替代 Python SOP（性能差 10-100 倍）
+  4.降低 scatter/copy 点数、减少多边形细分
+  5.使用 Packed Primitives 减少内存和 cook 开销
+  6.检查 for-each 循环中的迭代次数是否过多
+
 联网搜索策略（使用 web_search 前必须遵守）:
 -将用户问题转化为精准搜索关键词，不要直接用原始问题当搜索词
 -Houdini 相关问题优先加 "SideFX Houdini" 前缀
@@ -404,7 +423,27 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
 -**不要一次性展开所有 box**，只展开当前任务需要操作的那个 box，操作完成后再按需展开下一个
 -未分组节点会在概览结果中直接显示详情，无需额外操作
 -跨组连接会在概览中单独列出，帮助你理解 box 之间的数据流向"""
-        
+
+        # 注入 Labs 节点目录（让 AI 知道 Labs 工具的存在）
+        try:
+            from ..utils.doc_rag import get_doc_index
+            labs_catalog = get_doc_index().get_labs_catalog()
+            if labs_catalog:
+                base_prompt += f"""
+
+SideFX Labs 节点使用规则（必须严格遵守）:
+-以下是 SideFX Labs 工具集的节点目录。Labs 提供了大量游戏开发、纹理烘焙、地形、程序化生成等高级工具。
+-当用户需求涉及游戏资产优化、LOD生成、纹理烘焙、Flowmap、摄影测量、树木生成、UV处理等场景时，**优先考虑使用 Labs 节点**而非从零搭建。
+-**使用任何 Labs 节点之前，必须先调用 search_local_doc("Labs 节点名") 查询该节点的详细文档**，了解其参数和用法后再创建节点。禁止凭猜测使用 Labs 节点。
+-Labs 节点创建时的 node_type 格式通常为 "labs::" 前缀加节点名（如 "labs::lod_create"），如果创建失败，用 search_node_types 搜索正确的类型名。
+-**Labs 节点都是高度封装的 HDA（数字资产）**，通常拥有多个输入和输出端口，内部包含完整的节点网络。如果对某个 Labs 节点的具体实现不清楚，可以使用 get_network_structure(network_path="节点路径") 进入其内部查看实际的节点网络和连接关系。
+-连接 Labs 节点时，注意查看连接关系中的输入端口名称（input_label），确保将正确的数据连接到正确的输入端口。
+
+{labs_catalog}
+"""
+        except Exception:
+            pass
+
         # 使用极致优化器压缩（已缓存）
         return UltraOptimizer.compress_system_prompt(base_prompt)
 
@@ -1452,12 +1491,57 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
             except queue.Empty:
                 return {"success": False, "error": "工具执行超时（30秒）"}
     
+    # 已自带 checkpoint 追踪的工具（在 _on_add_node_operation 中有专用分支）
+    _SELF_TRACKING_TOOLS = frozenset({
+        'create_node', 'create_nodes_batch', 'create_wrangle_node',
+        'delete_node', 'set_node_parameter',
+    })
+
+    @staticmethod
+    def _snapshot_network_children() -> dict:
+        """快照当前网络的子节点列表 {path: {name, type, path}}"""
+        try:
+            import hou  # type: ignore
+            network = None
+            try:
+                editor = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
+                if editor:
+                    network = editor.pwd()
+            except Exception:
+                pass
+            if not network:
+                network = hou.node('/obj/geo1') or hou.node('/obj')
+            if not network:
+                return {}
+            return {
+                node.path(): {
+                    'name': node.name(),
+                    'type': node.type().name(),
+                    'path': node.path(),
+                }
+                for node in network.children()
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _diff_network_children(before: dict, after: dict):
+        """对比前后子节点快照，返回 {created: [...], deleted: [...]} 或 None"""
+        before_paths = set(before.keys())
+        after_paths = set(after.keys())
+        created = [after[p] for p in sorted(after_paths - before_paths)]
+        deleted = [before[p] for p in sorted(before_paths - after_paths)]
+        if not created and not deleted:
+            return None
+        return {'created': created, 'deleted': deleted}
+
     @QtCore.Slot(str, dict)
     def _on_execute_tool_main_thread(self, tool_name: str, kwargs: dict):
         """在主线程执行工具（槽函数）
         
         注意：此方法在主线程中执行，直接操作 Houdini API 是安全的。
         所有修改操作包裹在 undo group 中，支持一键撤销整个 Agent 操作。
+        ★ 对于未自带 checkpoint 的修改工具，会在执行前后快照网络子节点以检测变更。
         """
         result = {"success": False, "error": "未知错误"}
         
@@ -1466,9 +1550,17 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
             "create_node", "create_nodes_batch", "create_wrangle_node",
             "delete_node", "set_node_parameter", "connect_nodes",
             "copy_node", "batch_set_parameters", "set_display_flag",
-            "execute_python", "save_hip",
+            "execute_python", "save_hip", "run_skill",
         }
         use_undo_group = tool_name in _MUTATING_TOOLS
+        
+        # ★ 对不自带 checkpoint 追踪的修改工具，做 before/after 快照
+        should_snapshot = (
+            tool_name in _MUTATING_TOOLS
+            and tool_name not in self._SELF_TRACKING_TOOLS
+            and tool_name != 'save_hip'  # save 无需快照
+        )
+        before_children = self._snapshot_network_children() if should_snapshot else {}
         
         try:
             # 对修改操作开启 undo group
@@ -1549,6 +1641,16 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
         except Exception as e:
             result = {"success": False, "error": f"工具执行异常: {str(e)}"}
         finally:
+            # ★ 执行后快照 & diff，检测节点变更
+            if should_snapshot and result.get("success"):
+                try:
+                    after_children = self._snapshot_network_children()
+                    changes = self._diff_network_children(before_children, after_children)
+                    if changes:
+                        result['_node_changes'] = changes
+                except Exception:
+                    pass  # 快照失败不影响工具结果
+
             # 关闭 undo group
             if use_undo_group:
                 try:
@@ -1577,6 +1679,7 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
         '|web_search|fetch_webpage|search_local_doc|get_houdini_node_doc'
         '|execute_python|execute_shell|check_errors|get_node_inputs|add_todo|update_todo'
         '|verify_and_summarize|run_skill|list_skills'
+        '|perf_start_profile|perf_stop_and_report'
     )
     _FAKE_TOOL_PATTERNS = re.compile(
         r'^\[(?:ok|err)\]\s*(?:' + _ALL_TOOL_NAMES + r')\s*[:\uff1a]',
@@ -2477,6 +2580,9 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
                 # 同时设置 ToolCallItem 结果
                 short = f"[ok] Python ({len(code.splitlines())} lines)" if success else f"[err] {result_text[:50]}"
                 invoke_on_main(self, "_add_tool_result_ui", name, short)
+                # ★ 如果 execute_python 导致了节点变更，额外生成 checkpoint
+                if result.get('_node_changes'):
+                    self._addNodeOperation.emit(name, result)
                 return
         
         # === execute_shell 专用展示 ===
@@ -2494,6 +2600,10 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
                 short = f"[ok] $ {command[:40]}" if success else f"[err] {result_text[:50]}"
                 invoke_on_main(self, "_add_tool_result_ui", name, short)
                 return
+        
+        # ★ 通用节点变更检测：任何工具如果通过 before/after 快照检测到节点变更，生成 checkpoint
+        if result.get('_node_changes') and result.get('success'):
+            self._addNodeOperation.emit(name, result)
         
         # 检查是否是节点操作，需要高亮显示
         # 但如果是失败的操作，也要显示错误信息
@@ -2629,6 +2739,47 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
                         "new_value": new_val,
                     }
                     label = NodeOperationLabel('modify', 1, paths, param_diff=param_diff) if paths else None
+            
+            # ★ 通用变更检测（execute_python, run_skill, copy_node 等通过 before/after 快照检测到的变更）
+            node_changes = result.get('_node_changes')
+            if node_changes and label is None:
+                created = node_changes.get('created', [])
+                deleted = node_changes.get('deleted', [])
+                labels_to_add = []
+                
+                if created:
+                    c_paths = [n['path'] for n in created]
+                    op_type = 'create'
+                    paths = c_paths
+                    labels_to_add.append(
+                        ('create', len(created), c_paths, None)
+                    )
+                if deleted:
+                    d_paths = [n['path'] for n in deleted]
+                    if not created:
+                        op_type = 'delete'
+                        paths = d_paths
+                    labels_to_add.append(
+                        ('delete', len(deleted), d_paths, None)
+                    )
+                
+                # 为每种操作类型生成独立的 checkpoint label
+                for l_op, l_count, l_paths, _ in labels_to_add:
+                    l_label = NodeOperationLabel(l_op, l_count, l_paths)
+                    l_label.nodeClicked.connect(self._navigate_to_node)
+                    l_label.undoRequested.connect(
+                        lambda _op=l_op, _paths=list(l_paths), _snap=None:
+                            self._undo_node_operation(_op, _paths, _snap)
+                    )
+                    resp.details_layout.addWidget(l_label)
+                    entry = (l_label, l_op, list(l_paths), None)
+                    self._pending_ops.append(entry)
+                    l_label.decided.connect(self._update_batch_bar)
+                
+                if labels_to_add:
+                    self._update_batch_bar()
+                    self._scroll_agent_to_bottom()
+                    return  # 已处理，跳过下面的通用逻辑
             
             if label:
                 label.nodeClicked.connect(self._navigate_to_node)
@@ -3034,6 +3185,10 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
             'estimated_cost': 0.0,
         }
         self._call_records = []
+        
+        # ── 清理待确认操作列表和批量操作栏 ──
+        self._pending_ops.clear()
+        self._batch_bar.setVisible(False)
         
         while self.chat_layout.count() > 1:
             item = self.chat_layout.takeAt(0)
@@ -4307,8 +4462,6 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
                     if thinking:
                         response.add_thinking(thinking)
                         response.thinking_section.finalize()
-                        if not response.thinking_section._collapsed:
-                            response.thinking_section.toggle()
                     self._render_old_tool_msgs(response, tool_msgs)
                     self._restore_shell_widgets(response, msg)
                     response.set_content(content)
@@ -4414,8 +4567,6 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
         if thinking:
             response.add_thinking(thinking)
             response.thinking_section.finalize()
-            if not response.thinking_section._collapsed:
-                response.thinking_section.toggle()
         
         # 恢复 Shell 折叠面板
         self._restore_shell_widgets(response, final_msg)
@@ -4558,8 +4709,6 @@ NetworkBox 层级导航（大型网络查询策略，必须遵守）:
         if thinking:
             response.add_thinking(thinking)
             response.thinking_section.finalize()
-            if not response.thinking_section._collapsed:
-                response.thinking_section.toggle()
 
         # 恢复正文（[工具执行结果]之后可能还有 AI 正式回复）
         # 找到工具摘要之后的正文部分

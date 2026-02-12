@@ -12,7 +12,7 @@ Built on the **OpenAI Function Calling** protocol, the agent can read node netwo
 
 The AI operates in an autonomous **agent loop**: it receives a user request, plans the steps, calls tools, inspects results, and iterates until the task is complete. Two modes are available:
 
-- **Agent mode** — Full access to all 30+ tools. The AI can create, modify, connect, and delete nodes, set parameters, execute scripts, and save the scene.
+- **Agent mode** — Full access to all 35+ tools. The AI can create, modify, connect, and delete nodes, set parameters, execute scripts, and save the scene.
 - **Ask mode** — Read-only. The AI can only query scene structure, inspect parameters, search documentation, and provide analysis. All mutating tools are blocked by a whitelist guard.
 
 ```
@@ -122,6 +122,13 @@ User request → AI plans → call tools → inspect results → call more tools
 | `add_nodes_to_box` | Add nodes to an existing NetworkBox with optional auto-fit |
 | `list_network_boxes` | List all NetworkBoxes in a network with their contents and metadata |
 
+### Performance Profiling
+
+| Tool | Description |
+|------|-------------|
+| `perf_start_profile` | Start Houdini perfMon profiling — optionally force-cook a node to trigger the full chain |
+| `perf_stop_and_report` | Stop profiling and return a detailed cook-time / memory report (paginated) |
+
 ### Task Management
 
 | Tool | Description |
@@ -143,6 +150,7 @@ Skills are pre-optimized Python scripts that run inside the Houdini environment 
 | `find_dead_nodes` | Find orphan and unused end-of-chain nodes |
 | `trace_node_dependencies` | Trace upstream dependencies or downstream impacts |
 | `find_attribute_references` | Find all nodes referencing a given attribute (VEX code, expressions, string params) |
+| `analyze_cook_performance` | **New** — Network-wide cook-time ranking, geometry-inflation detection, error/warning nodes, bottleneck identification |
 
 ## Project Structure
 
@@ -159,6 +167,15 @@ Houdini-Agent/
 │   ├── houdini_knowledge_base.txt  # Houdini programming knowledge base
 │   ├── vex_attributes_reference.txt
 │   ├── vex_snippets_reference.txt
+│   ├── labs_knowledge_base.txt     # SideFX Labs nodes knowledge base
+│   ├── heightfields_knowledge_base.txt  # HeightField / Terrain knowledge base
+│   ├── copernicus_knowledge_base.txt    # Copernicus (COP) knowledge base
+│   ├── ml_knowledge_base.txt       # Machine Learning knowledge base
+│   ├── mpm_knowledge_base.txt      # MPM solver knowledge base
+│   ├── copernicus/                  # Copernicus raw docs
+│   ├── heightfields/                # HeightField raw docs
+│   ├── ml/                          # ML raw docs
+│   ├── mpm/                         # MPM raw docs
 │   ├── nodes.zip                   # Node docs index (wiki markup)
 │   ├── vex.zip                     # VEX function docs index
 │   └── hom.zip                     # HOM class/method docs index
@@ -189,7 +206,8 @@ Houdini-Agent/
     │   ├── connectivity_analysis.py # Connected components
     │   ├── find_attrib_references.py # Attribute usage search
     │   ├── find_dead_nodes.py     # Dead/orphan node finder
-    │   └── trace_dependencies.py  # Dependency tree tracer
+    │   ├── trace_dependencies.py  # Dependency tree tracer
+    │   └── analyze_cook_performance.py # Cook-time ranking & bottleneck detection
     └── utils/
         ├── ai_client.py           # AI API client (streaming, Function Calling, web search)
         ├── doc_rag.py             # Local doc index (nodes/VEX/HOM O(1) lookup)
@@ -405,6 +423,7 @@ Created attribwrangle1 with random Cd attribute on all points.
 
 ## Version History
 
+- **v6.8** — **Performance profiling & expanded knowledge**: New `perf_start_profile` / `perf_stop_and_report` tools for precise Houdini perfMon-based cook-time and memory profiling. New `analyze_cook_performance` skill for quick network-wide cook-time ranking and bottleneck detection without perfMon. **Expanded knowledge bases**: 5 new domain-specific knowledge bases — SideFX Labs (301KB, with auto-injected node catalog in system prompt), HeightFields/Terrain (249KB), Copernicus/COP (87KB), MPM solver (91KB), Machine Learning (53KB); knowledge trigger keywords extended from VEX-only to all domains. **Labs catalog injection**: System prompt dynamically injects a categorized Labs node directory so the AI proactively recommends Labs tools for game dev, texture baking, terrain, procedural generation, etc. **Universal node-change detection**: `execute_python`, `run_skill`, `copy_node`, and other mutation tools now take before/after network snapshots to auto-generate checkpoint labels and undo entries — previously only `create_node` / `set_node_parameter` had this. **Connection port labels**: `get_network_structure` and all connection displays now show `input_label` (e.g. `First Input(0)`) alongside the index for clearer data-flow understanding. **Thinking section always expanded**: `ThinkingSection` defaults to expanded and stays open after finalization (user preference). **Obstacle collaboration rules**: System prompt now explicitly forbids the AI from abandoning a plan when encountering obstacles — instead it must pause, describe the blocker clearly, and request specific user action. **Performance optimization guidelines**: System prompt includes 6 common optimization strategies (cache nodes, avoid time-dependent expressions, VEX over Python SOP, reduce scatter counts, packed primitives, for-each loop audit). **Pending ops cleanup**: Chat clear now properly resets the batch operations bar and pending ops list.
 - **v6.7** — **PySide2/PySide6 compatibility**: Unified `qt_compat.py` layer auto-detects PySide version; all modules import from this single source. `invoke_on_main()` helper abstracts `QMetaObject.invokeMethod`+`Q_ARG` (PySide6) vs `QTimer.singleShot` (PySide2). Supports Houdini 20.5 (PySide2) through Houdini 21+ (PySide6). **Streaming performance fix**: `AIResponse.content_label` switched from `QLabel.setText` (O(n) full re-render) to `QPlainTextEdit.insertPlainText` (O(1) incremental append) — eliminates long-reply streaming stutter. Dynamic height auto-resize via `contentsChanged` signal. Buffer flush threshold raised to 200 chars / 250ms. **Image content stripping**: New `_strip_image_content()` in `AIClient` strips base64 `image_url` from older messages to prevent 413 context overflow; integrated into `_progressive_trim` (level-aware: keeps 2→1→0 recent images) and `agent_loop_auto`/`agent_loop_json_mode` (pre-strip for non-vision models). **Cursor-style image lifecycle**: Only the current round's user message retains images for vision models; all older rounds are automatically stripped to plain text. **@-mention keyboard navigation**: Up/Down arrows navigate the completer list; Enter/Tab select; Escape closes; mouse click and focus-out auto-dismiss the popup. **Token Analytics**: Records now displayed newest-first (reversed order). **DeepSeek context limit**: Updated from 64K→128K for both `deepseek-chat` and `deepseek-reasoner`. **Wrangle class mapping**: System prompt now documents run_over class integer values (0=Detail, 1=Primitives, 2=Points, 3=Vertices, 4=Numbers) for `set_node_parameter`. **Progressive trim tuning**: Level 2 keeps 3 rounds (was 5); level 3 keeps 2 rounds (was 3); `isinstance(c, str)` guard prevents crashing on multimodal tool content.
 - **v6.6** — **Mixin architecture**: `ai_tab.py` decomposed into 5 focused Mixin modules (`HeaderMixin`, `InputAreaMixin`, `ChatViewMixin`, `AgentRunnerMixin`, `SessionManagerMixin`) for better maintainability. **NetworkBox tools**: 3 new tools — `create_network_box` (semantic color presets: input/processing/deform/output/simulation/utility, auto-include nodes), `add_nodes_to_box`, `list_network_boxes`; `get_network_structure` enhanced with `box_name` drill-in and overview mode that auto-folds boxes to save tokens. **NetworkBox grouping rules**: System prompt requires AI to organize nodes into NetworkBoxes after each logical stage (min 6 nodes per group), with hierarchical navigation guidelines. **Confirm mode**: `AgentRunnerMixin` adds confirmation dialog for destructive tools (create/delete/modify) before execution. **ThinkingSection overhaul**: Switched from `QLabel` to `QPlainTextEdit` with scrollbar, dynamic height calculation matching `ChatInput` approach, max 400px. **PulseIndicator**: Animated opacity-pulsing dot widget for "in progress" status. **ToolStatusBar**: Real-time tool execution status display below input area. **NodeCompleterPopup**: `@`-mention autocomplete for node paths. **Updater refactored**: Now uses GitHub Releases API (not branch-based VERSION file), cached `zipball_url`. **Training data exporter**: Multimodal content extraction (strips images, keeps text from list-format messages). **Module reload**: All Mixin modules added to reload list; `MainWindow` reference refreshed after reload; `deleteLater()` on old window for clean teardown.
 - **v6.5** — **Agent / Ask mode**: Radio-style toggle below the input area — Agent mode has full tool access; Ask mode restricts to read-only/query tools with a whitelist guard and system prompt constraint. **Undo All / Keep All**: Batch operations bar tracks all pending node/param changes; "Undo All" reverts in reverse order, "Keep All" confirms everything at once. **Deep thinking framework**: `<think>` tag now requires a structured 6-step process (Understand → Status → Options → Decision → Plan → Risk) with explicit thinking principles. **Auto-updater**: `VERSION` file for semver tracking; silent GitHub API check on startup; one-click download + apply + restart with a progress dialog; preserves `config/`, `cache/`, `trainData/` during update. **`tools_override`**: `agent_loop_stream` and `agent_loop_json_mode` accept custom tool lists for mode-specific filtering. ParamDiff defaults to expanded. Skip undo snapshot when parameter value is unchanged.

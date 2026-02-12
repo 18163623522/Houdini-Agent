@@ -843,17 +843,38 @@ class HoudiniDocIndex:
                     _add(self._fmt_node(ndoc), ndoc.node_type)
                     break
 
-        # 4) 知识库匹配 — 涉及 VEX 属性/语法/常见模式时注入
+        # 4) 知识库匹配 — 涉及已收录主题时注入
         if self.knowledge_chunks:
-            _VEX_HINTS = {
+            _KB_HINTS = {
+                # VEX / Wrangle
                 "属性", "attribute", "vex", "@P", "@N", "@Cd", "pscale", "orient",
                 "snippet", "代码", "函数", "语法", "wrangle", "噪波", "noise",
                 "copy", "scatter", "颜色", "法线", "位置", "run over",
                 "nearpoint", "pcfind", "addpoint", "setpointattrib",
                 "hou.", "python", "表达式", "hscript", "变量",
+                # Heightfields / Terrain
+                "heightfield", "terrain", "地形", "height", "erosion", "侵蚀",
+                "mask", "蒙版", "layer", "图层",
+                # Copernicus / COP
+                "copernicus", "cop", "图像", "image", "texture", "纹理",
+                "composite", "合成", "filter", "滤镜", "gpu",
+                # MPM
+                "mpm", "物理", "模拟", "simulation", "solver", "求解器",
+                "snow", "雪", "soil", "mud", "泥", "concrete", "混凝土",
+                "rubber", "橡胶", "jello", "sand", "沙",
+                # Machine Learning
+                "machine learning", "ml", "机器学习", "train", "训练",
+                "inference", "推理", "model", "dataset", "数据集", "onnx",
+                # Labs
+                "labs", "sidefx labs", "游戏", "game", "gamedev",
+                "baker", "bake", "烘焙", "lod", "impostor", "flowmap",
+                "osm", "photogrammetry", "摄影测量", "wfc", "wave function",
+                "tree", "pivot painter", "unreal", "fbx",
+                "trim texture", "triplanar", "texel", "mesh slice",
+                "destruction", "niagara", "wang tile",
             }
             msg_lower = user_message.lower()
-            if any(h in msg_lower for h in _VEX_HINTS):
+            if any(h in msg_lower for h in _KB_HINTS):
                 kb_results = self.search_knowledge(user_message, top_k=2)
                 for kr in kb_results:
                     if kr["score"] > 0.3:
@@ -862,6 +883,104 @@ class HoudiniDocIndex:
         if not snippets:
             return ""
         return "[Houdini 文档参考]\n" + "\n".join(snippets)
+
+    # ==========================================================
+    # Labs 目录生成（供 system prompt 注入）
+    # ==========================================================
+
+    _labs_catalog_cache: Optional[str] = None
+
+    def get_labs_catalog(self) -> str:
+        """生成紧凑的 Labs 节点目录，供注入 system prompt
+
+        从 labs_knowledge_base 的 chunk 标题中提取节点名，
+        按功能分类输出，约 2000~3000 字符。
+        """
+        if self._labs_catalog_cache is not None:
+            return self._labs_catalog_cache
+
+        labs_chunks = [c for c in self.knowledge_chunks
+                       if c.source == 'labs_knowledge_base']
+        if not labs_chunks:
+            self._labs_catalog_cache = ""
+            return ""
+
+        # 提取节点名 + 简短描述
+        nodes = []
+        for chunk in labs_chunks:
+            name = chunk.title.strip()
+            # 去掉 "geometry node", "render node" 等后缀
+            name = re.sub(
+                r'(geometry|render|object|compositing|sop|cop|top|rop|lop|dop|vop)\s*node\s*$',
+                '', name, flags=re.IGNORECASE
+            ).strip()
+            # 去掉版本号 如 6.0, 1.0
+            name = re.sub(r'\d+\.\d+$', '', name).strip()
+            # 简短描述（取 content 前 60 字符）
+            desc = chunk.content[:80].split('\n')[0].strip()
+            if len(desc) > 60:
+                desc = desc[:60] + '...'
+            nodes.append((name, desc))
+
+        if not nodes:
+            self._labs_catalog_cache = ""
+            return ""
+
+        # 按功能分类
+        categories: Dict[str, List[str]] = {
+            '游戏开发/优化': [], '纹理/UV': [], '地形': [],
+            '摄影测量': [], '程序化生成': [], '建模/几何': [],
+            'FX/视觉': [], '导入导出': [], 'Flowmap': [],
+            '树木生成': [], '工具': [],
+        }
+
+        for name, desc in nodes:
+            nl = name.lower()
+            dl = desc.lower()
+            c = nl + ' ' + dl
+            if 'av ' in nl or 'alicevision' in dl or 'photogramm' in dl:
+                categories['摄影测量'].append(name)
+            elif 'flowmap' in nl:
+                categories['Flowmap'].append(name)
+            elif 'tree' in nl and any(w in nl for w in ('branch', 'trunk', 'leaf', 'controller', 'simple leaf')):
+                categories['树木生成'].append(name)
+            elif any(w in c for w in ('game', 'lod', 'baker', 'bake', 'pivot painter',
+                                       'impostor', 'niagara', 'unreal', 'fbx archive')):
+                categories['游戏开发/优化'].append(name)
+            elif any(w in c for w in ('texture', 'texel', 'trim', 'uv ', 'material',
+                                       'triplanar', 'normal', 'detail mesh')):
+                categories['纹理/UV'].append(name)
+            elif any(w in c for w in ('terrain', 'height', 'slope', 'hf ')):
+                categories['地形'].append(name)
+            elif any(w in c for w in ('wfc', 'wave function', 'lightning', 'superformula',
+                                       'wang tile', 'sci-fi', 'scifi')):
+                categories['程序化生成'].append(name)
+            elif any(w in c for w in ('mesh', 'edge', 'dissolve', 'thicken', 'border',
+                                       'partition', 'skeleton', 'path deform', 'group',
+                                       'poly', 'deform', 'resample', 'inside face')):
+                categories['建模/几何'].append(name)
+            elif any(w in c for w in ('destruction', 'color', 'shader', 'pbr', 'toon',
+                                       'physics', 'fracture', 'pyro', 'rbd', 'smoke')):
+                categories['FX/视觉'].append(name)
+            elif any(w in c for w in ('export', 'import', 'osm', 'csv', 'xyz', 'goz',
+                                       'obj import', 'substance', 'marmoset', 'vector field',
+                                       'volume', 'sketchfab', 'pdg')):
+                categories['导入导出'].append(name)
+            else:
+                categories['工具'].append(name)
+
+        # 生成紧凑文本
+        lines = [f"SideFX Labs 可用节点({len(nodes)}个) - 使用前必须先用 search_local_doc 查询详细文档:"]
+        for cat, items in categories.items():
+            if not items:
+                continue
+            # 去重
+            unique = sorted(set(items))
+            lines.append(f"  [{cat}] {', '.join(unique)}")
+
+        catalog = '\n'.join(lines)
+        self._labs_catalog_cache = catalog
+        return catalog
 
     # --- 格式化 ---
 

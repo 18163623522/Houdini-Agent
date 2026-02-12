@@ -265,8 +265,9 @@ class ThinkingSection(CollapsibleSection):
     _MAX_HEIGHT_PX = 400
     
     def __init__(self, parent=None):
-        # ★ 默认折叠（和原版一致），首次收到思考内容时自动展开
-        super().__init__("思考中...", icon="", collapsed=True, parent=parent)
+        # ★ 默认展开（用户要求不自动折叠）；section 整体初始 setVisible(False)，
+        #   首次收到思考内容时 setVisible(True) 即可，内容区已处于展开状态。
+        super().__init__("思考中...", icon="", collapsed=False, parent=parent)
         # ★ 防止被父布局拉伸 —— 内容多大就多大
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
@@ -378,8 +379,8 @@ class ThinkingSection(CollapsibleSection):
         self.thinking_label.setPlainText(self._thinking_text)
         QtCore.QTimer.singleShot(0, self._update_height)
         self.set_title(f"思考中... ({_fmt_duration(self._total_elapsed())})")
-        if self._collapsed:
-            self.toggle()
+        # ★ 始终确保展开
+        self.expand()
     
     def finalize(self):
         if self._finalized:
@@ -388,8 +389,8 @@ class ThinkingSection(CollapsibleSection):
         self._accumulated_seconds += (time.time() - self._round_start)
         total = self._accumulated_seconds
         self.set_title(f"思考过程 ({_fmt_duration(total)})")
-        if not self._collapsed:
-            self.toggle()
+        # ★ 防御性展开：确保思考区块在任何情况下都保持展开
+        self.expand()
 
 
 # ============================================================
@@ -1204,9 +1205,8 @@ class AIResponse(QtWidgets.QWidget):
         if not self._has_thinking:
             self._has_thinking = True
             self.thinking_section.setVisible(True)
-            # 首次收到思考内容时自动展开，让用户看到实时推理
-            if self.thinking_section._collapsed:
-                self.thinking_section.toggle()
+            # 确保思考区块处于展开状态
+            self.thinking_section.expand()
         self.thinking_section.append_thinking(text)
     
     def update_thinking_time(self):

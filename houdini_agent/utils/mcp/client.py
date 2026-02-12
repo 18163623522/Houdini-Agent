@@ -99,6 +99,9 @@ class HoudiniMCP:
     _common_node_inputs_cache: Dict[str, str] = {}  # 常见节点输入信息缓存
     _ats_cache: Dict[str, Dict[str, Any]] = {}  # ATS缓存: {node_type_key: ats_data}
 
+    # perfMon 性能分析：当前活跃的 profile 对象
+    _active_perf_profile: Any = None
+
     # 通用工具结果分页缓存：key = "tool_name:unique_key" → 完整文本
     _tool_page_cache: Dict[str, str] = {}
     _TOOL_PAGE_LINES = 50  # 每页行数
@@ -176,7 +179,8 @@ class HoudiniMCP:
                     {
                         "from": str,  # 源节点路径
                         "to": str,    # 目标节点路径
-                        "input_index": int
+                        "input_index": int,
+                        "input_label": str  # 输入端口名称（如有）
                     }
                 ]
             }
@@ -254,14 +258,22 @@ class HoudiniMCP:
                     
                     nodes_data.append(node_info)
                     
-                    # 收集连接关系
+                    # 收集连接关系（含输入端口名称）
                     for input_idx, input_node in enumerate(node.inputs()):
                         if input_node is not None:
-                            connections_data.append({
+                            conn_info = {
                                 "from": input_node.path(),
                                 "to": node.path(),
-                                "input_index": input_idx
-                            })
+                                "input_index": input_idx,
+                            }
+                            # 尝试获取输入端口标签
+                            try:
+                                input_label = node_type.inputLabel(input_idx)
+                                if input_label:
+                                    conn_info["input_label"] = input_label
+                            except Exception:
+                                pass
+                            connections_data.append(conn_info)
                 except Exception:
                     continue
             
@@ -338,17 +350,13 @@ class HoudiniMCP:
                 lines.append("")
                 lines.append("### 内部连接:")
                 for conn in box_conns:
-                    from_name = conn['from'].split('/')[-1]
-                    to_name = conn['to'].split('/')[-1]
-                    lines.append(f"- {from_name} → {to_name}[{conn['input_index']}]")
+                    lines.append(self._format_connection(conn))
             
             if cross_conns:
                 lines.append("")
                 lines.append("### 跨组连接（与其他 box / 未分组节点）:")
                 for conn in cross_conns:
-                    from_name = conn['from'].split('/')[-1]
-                    to_name = conn['to'].split('/')[-1]
-                    lines.append(f"- {from_name} → {to_name}[{conn['input_index']}]")
+                    lines.append(self._format_connection(conn))
             
             if wrangle_details:
                 lines.append("")
@@ -418,7 +426,10 @@ class HoudiniMCP:
                     to_name = conn['to'].split('/')[-1]
                     src_box = path_to_box.get(conn["from"], "未分组")
                     dst_box = path_to_box.get(conn["to"], "未分组")
-                    lines.append(f"- [{src_box}] {from_name} → {to_name} [{dst_box}] (input {conn['input_index']})")
+                    idx = conn['input_index']
+                    label = conn.get('input_label', '')
+                    port_str = f"{label}({idx})" if label else str(idx)
+                    lines.append(f"- [{src_box}] {from_name} → {to_name}[{port_str}] [{dst_box}]")
             
             return True, "\n".join(lines)
 
@@ -438,9 +449,7 @@ class HoudiniMCP:
             lines.append("")
             lines.append("### 连接关系:")
             for conn in data['connections']:
-                from_name = conn['from'].split('/')[-1]
-                to_name = conn['to'].split('/')[-1]
-                lines.append(f"- {from_name} → {to_name}[{conn['input_index']}]")
+                lines.append(self._format_connection(conn))
         
         if wrangle_details:
             lines.append("")
@@ -485,6 +494,19 @@ class HoudiniMCP:
                 wrangle_details.append(
                     f"#### `{node['name']}` Python 代码:\n```python\n{code}\n```"
                 )
+
+    @staticmethod
+    def _format_connection(conn: Dict[str, Any], prefix: str = "- ") -> str:
+        """格式化单条连接信息，包含输入端口名称（如有）"""
+        from_name = conn['from'].split('/')[-1]
+        to_name = conn['to'].split('/')[-1]
+        idx = conn['input_index']
+        label = conn.get('input_label', '')
+        if label:
+            port_str = f"{label}({idx})"
+        else:
+            port_str = str(idx)
+        return f"{prefix}{from_name} → {to_name}[{port_str}]"
 
     # ========================================
     # ATS (Abstract Type System) 构建
@@ -2968,6 +2990,147 @@ class HoudiniMCP:
         return {"success": ok, "result": info if ok else "", "error": "" if ok else info}
 
     # ========================================
+    # 性能分析 (perfMon) 工具
+    # ========================================
+
+    def _tool_perf_start_profile(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """启动 hou.perfMon 性能 profile"""
+        if hou is None:
+            return {"success": False, "error": "Houdini 环境不可用"}
+
+        title = args.get("title", "AI Performance Analysis")
+        force_cook_node = args.get("force_cook_node", "")
+
+        # 如果已有活跃 profile，先停止旧的
+        if self._active_perf_profile is not None:
+            try:
+                self._active_perf_profile.stop()
+            except Exception:
+                pass
+            self._active_perf_profile = None
+
+        try:
+            profile = hou.perfMon.startProfile(title)
+            self._active_perf_profile = profile
+        except Exception as e:
+            return {"success": False, "error": f"启动 perfMon profile 失败: {e}"}
+
+        result_msg = f"已启动性能 profile: {title}"
+
+        # 可选：启动后立即强制 cook 指定节点
+        if force_cook_node:
+            node = hou.node(force_cook_node)
+            if node:
+                try:
+                    node.cook(force=True)
+                    result_msg += f"\n已强制 cook 节点: {force_cook_node}"
+                except Exception as e:
+                    result_msg += f"\n强制 cook {force_cook_node} 失败: {e}"
+            else:
+                result_msg += f"\n警告: 节点 {force_cook_node} 不存在，跳过 cook"
+
+        result_msg += "\n提示: 完成操作后调用 perf_stop_and_report 获取分析报告。"
+        return {"success": True, "result": result_msg}
+
+    def _tool_perf_stop_and_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """停止 perfMon profile 并返回分析报告"""
+        if hou is None:
+            return {"success": False, "error": "Houdini 环境不可用"}
+
+        if self._active_perf_profile is None:
+            return {"success": False, "error": "没有活跃的性能 profile。请先调用 perf_start_profile 启动。"}
+
+        save_path = args.get("save_path", "")
+
+        profile = self._active_perf_profile
+        self._active_perf_profile = None
+
+        try:
+            profile.stop()
+        except Exception as e:
+            return {"success": False, "error": f"停止 profile 失败: {e}"}
+
+        # 获取统计数据
+        stats_data = None
+        try:
+            stats_data = profile.stats()
+        except Exception as e:
+            return {"success": False, "error": f"获取 profile 统计数据失败: {e}"}
+
+        # 可选：保存到磁盘
+        save_msg = ""
+        if save_path:
+            try:
+                hou.perfMon.saveProfile(profile, save_path)
+                save_msg = f"\n已保存 profile 到: {save_path}"
+            except Exception as e:
+                save_msg = f"\n保存 profile 失败: {e}"
+
+        # 解析统计数据，提取关键指标
+        report_parts = ["=== 性能分析报告 ==="]
+
+        if isinstance(stats_data, dict):
+            # 尝试提取 cook 事件统计
+            cook_stats = stats_data.get("cookStats", stats_data.get("cook_stats", {}))
+            script_stats = stats_data.get("scriptStats", stats_data.get("script_stats", {}))
+            memory_stats = stats_data.get("memoryStats", stats_data.get("memory_stats", {}))
+
+            if cook_stats:
+                report_parts.append("\n--- Cook 统计 ---")
+                # 解析节点 cook 时间
+                node_times = []
+                if isinstance(cook_stats, dict):
+                    for key, val in cook_stats.items():
+                        if isinstance(val, dict):
+                            t = val.get("time", val.get("selfTime", 0))
+                            node_times.append((key, t))
+                        elif isinstance(val, (int, float)):
+                            node_times.append((key, val))
+                node_times.sort(key=lambda x: x[1], reverse=True)
+                for name, t in node_times[:15]:
+                    report_parts.append(f"  {name}: {t:.2f}ms")
+                if len(node_times) > 15:
+                    report_parts.append(f"  ... 还有 {len(node_times) - 15} 个条目")
+
+            if script_stats:
+                report_parts.append("\n--- 脚本统计 ---")
+                if isinstance(script_stats, dict):
+                    for key, val in list(script_stats.items())[:10]:
+                        report_parts.append(f"  {key}: {val}")
+
+            if memory_stats:
+                report_parts.append("\n--- 内存统计 ---")
+                if isinstance(memory_stats, dict):
+                    for key, val in list(memory_stats.items())[:10]:
+                        report_parts.append(f"  {key}: {val}")
+
+            if not cook_stats and not script_stats and not memory_stats:
+                # 统计格式未知，输出原始数据的摘要
+                import json as _json
+                raw = _json.dumps(stats_data, indent=2, default=str, ensure_ascii=False)
+                if len(raw) > 2000:
+                    raw = raw[:2000] + "\n... (truncated)"
+                report_parts.append("\n--- 原始统计数据 ---")
+                report_parts.append(raw)
+        elif isinstance(stats_data, str):
+            report_parts.append(stats_data[:3000])
+        else:
+            report_parts.append(f"统计数据类型: {type(stats_data).__name__}")
+            report_parts.append(str(stats_data)[:3000])
+
+        if save_msg:
+            report_parts.append(save_msg)
+
+        full_report = "\n".join(report_parts)
+
+        # 使用分页返回
+        page = int(args.get("page", 1))
+        cache_key = "perf_stop_and_report:latest"
+        hint = f'perf_stop_and_report(page={page})'
+        return {"success": True, "result": self._paginate_tool_result(
+            full_report, cache_key, hint, page)}
+
+    # ========================================
     # 工具分派表 & 用法提示 & 安全检查
     # ========================================
 
@@ -3003,6 +3166,9 @@ class HoudiniMCP:
         "create_network_box": 'create_network_box(parent_path="/obj/geo1", name="input_stage", comment="数据输入", color_preset="input", node_paths=["/obj/geo1/box1"])',
         "add_nodes_to_box": 'add_nodes_to_box(parent_path="/obj/geo1", box_name="input_stage", node_paths=["/obj/geo1/box1"])',
         "list_network_boxes": 'list_network_boxes(parent_path="/obj/geo1")',
+        # PerfMon 性能分析
+        "perf_start_profile": 'perf_start_profile(title="Cook Analysis", force_cook_node="/obj/geo1/output0")',
+        "perf_stop_and_report": 'perf_stop_and_report(save_path="C:/tmp/profile.hperf")',
     }
 
     # 工具名称 -> 处理方法名的映射表
@@ -3038,6 +3204,9 @@ class HoudiniMCP:
         "create_network_box": "_tool_create_network_box",
         "add_nodes_to_box": "_tool_add_nodes_to_box",
         "list_network_boxes": "_tool_list_network_boxes",
+        # PerfMon 性能分析
+        "perf_start_profile": "_tool_perf_start_profile",
+        "perf_stop_and_report": "_tool_perf_stop_and_report",
     }
 
     # Python 代码安全黑名单

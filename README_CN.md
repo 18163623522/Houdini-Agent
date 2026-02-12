@@ -122,6 +122,13 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 | `add_nodes_to_box` | 将节点添加到已有的 NetworkBox，支持自动调整大小 |
 | `list_network_boxes` | 列出网络中所有 NetworkBox 及其内容和元数据 |
 
+### 性能分析
+
+| 工具 | 说明 |
+|------|------|
+| `perf_start_profile` | 启动 Houdini perfMon 性能分析 — 可选强制 cook 指定节点以触发完整 cook 链 |
+| `perf_stop_and_report` | 停止性能分析并返回详细的 cook 时间 / 内存报告（分页） |
+
 ### 任务管理
 
 | 工具 | 说明 |
@@ -143,6 +150,7 @@ Skill 是预优化的 Python 脚本，在 Houdini 环境中运行，用于可靠
 | `find_dead_nodes` | 查找孤立节点和未使用的链末端节点 |
 | `trace_node_dependencies` | 追溯上游依赖树或下游影响范围 |
 | `find_attribute_references` | 查找网络中所有引用指定属性的节点（VEX 代码、表达式、字符串参数） |
+| `analyze_cook_performance` | **新增** — 全网络 cook 时间排名、几何体膨胀点检测、错误/警告节点、瓶颈识别 |
 
 ## 项目结构
 
@@ -159,6 +167,15 @@ Houdini-Agent/
 │   ├── houdini_knowledge_base.txt  # Houdini 编程知识库
 │   ├── vex_attributes_reference.txt
 │   ├── vex_snippets_reference.txt
+│   ├── labs_knowledge_base.txt     # SideFX Labs 节点知识库
+│   ├── heightfields_knowledge_base.txt  # HeightField / 地形知识库
+│   ├── copernicus_knowledge_base.txt    # Copernicus (COP) 知识库
+│   ├── ml_knowledge_base.txt       # 机器学习知识库
+│   ├── mpm_knowledge_base.txt      # MPM 求解器知识库
+│   ├── copernicus/                  # Copernicus 原始文档
+│   ├── heightfields/                # HeightField 原始文档
+│   ├── ml/                          # ML 原始文档
+│   ├── mpm/                         # MPM 原始文档
 │   ├── nodes.zip                   # 节点文档索引（wiki 标记格式）
 │   ├── vex.zip                     # VEX 函数文档索引
 │   └── hom.zip                     # HOM 类/方法文档索引
@@ -189,7 +206,8 @@ Houdini-Agent/
     │   ├── connectivity_analysis.py # 连通性分析
     │   ├── find_attrib_references.py # 属性引用搜索
     │   ├── find_dead_nodes.py     # 死节点/孤立节点查找
-    │   └── trace_dependencies.py  # 依赖树追溯
+    │   ├── trace_dependencies.py  # 依赖树追溯
+    │   └── analyze_cook_performance.py # Cook 时间排名与瓶颈检测
     └── utils/
         ├── ai_client.py           # AI API 客户端（流式传输、Function Calling、联网搜索）
         ├── doc_rag.py             # 本地文档索引（节点/VEX/HOM O(1) 查找）
@@ -405,6 +423,7 @@ Agent：[create_wrangle_node: vex_code="@Cd = set(rand(@ptnum), rand(@ptnum*13.3
 
 ## 版本历史
 
+- **v6.8** — **性能分析与扩展知识库**：新增 `perf_start_profile` / `perf_stop_and_report` 工具，基于 hou.perfMon 进行精确的 cook 时间和内存分析。新增 `analyze_cook_performance` Skill，快速诊断全网络 cook 时间排名和瓶颈节点（无需 perfMon）。**扩展知识库**：新增 5 个专题知识库 — SideFX Labs（301KB，含自动注入的节点分类目录）、HeightField/地形（249KB）、Copernicus/COP（87KB）、MPM 求解器（91KB）、机器学习（53KB）；知识库触发关键词从纯 VEX 扩展至全领域。**Labs 目录注入**：系统提示词动态注入 Labs 节点分类目录，AI 可主动推荐 Labs 工具用于游戏开发、纹理烘焙、地形生成、程序化创建等场景。**通用节点变更检测**：`execute_python`、`run_skill`、`copy_node` 等修改类工具执行前后自动快照网络子节点，检测到变更时生成 checkpoint 标签和撤销入口（之前仅 `create_node` / `set_node_parameter` 有此功能）。**连接端口名称**：`get_network_structure` 及所有连接关系显示中新增 `input_label`（如 `First Input(0)`），便于理解数据流方向。**思考区块默认展开**：`ThinkingSection` 默认展开且结束后保持展开状态（用户偏好）。**障碍协作规则**：系统提示词明确禁止 AI 在遇到障碍时放弃方案，要求暂停并清晰描述障碍和所需用户操作。**性能优化策略**：系统提示词内置 6 种常见优化手段（Cache 节点、避免 time dependent 表达式、VEX 替代 Python SOP、减少散点数量、Packed Primitives、for-each 循环审查）。**待确认操作清理**：清空对话时正确重置批量操作栏和待确认列表。
 - **v6.7** — **PySide2/PySide6 兼容**：统一 `qt_compat.py` 兼容层自动检测 PySide 版本，所有模块从单一源导入。`invoke_on_main()` 辅助函数抽象 `QMetaObject.invokeMethod`+`Q_ARG`（PySide6）vs `QTimer.singleShot`（PySide2）差异。支持 Houdini 20.5（PySide2）到 Houdini 21+（PySide6）。**流式输出性能修复**：`AIResponse.content_label` 从 `QLabel.setText`（O(n) 全文重排）切换为 `QPlainTextEdit.insertPlainText`（O(1) 增量追加），彻底消除长回复流式输出卡顿。通过 `contentsChanged` 信号自动调整高度。缓冲刷新阈值提升至 200 字符 / 250ms。**图片内容剥离**：`AIClient` 新增 `_strip_image_content()` 方法，从旧消息中剥离 base64 `image_url`，防止 413 上下文溢出；集成到 `_progressive_trim`（按裁剪级别保留 2→1→0 张近期图片）和 `agent_loop_auto`/`agent_loop_json_mode`（非视觉模型预处理剥离）。**Cursor 风格图片生命周期**：仅当前轮次的用户消息为视觉模型保留图片，旧轮次自动转为纯文本。**@提及键盘导航**：上下箭头在补全列表中导航，Enter/Tab 选中，Escape 关闭，鼠标点击和失焦自动收起弹窗。**Token 分析面板**：记录改为倒序显示（最新优先）。**DeepSeek 上下文限制**：从 64K 更新为 128K（`deepseek-chat` 和 `deepseek-reasoner`）。**Wrangle class 参数映射**：系统提示词新增 run_over class 整数值对应关系（0=Detail, 1=Primitives, 2=Points, 3=Vertices, 4=Numbers），方便 `set_node_parameter` 设置。**渐进裁剪调优**：Level 2 保留 3 轮（原 5 轮），Level 3 保留 2 轮（原 3 轮）；`isinstance(c, str)` 类型守卫防止多模态 tool 内容导致崩溃。
 - **v6.6** — **Mixin 架构拆分**：`ai_tab.py` 拆分为 5 个聚焦的 Mixin 模块（`HeaderMixin`、`InputAreaMixin`、`ChatViewMixin`、`AgentRunnerMixin`、`SessionManagerMixin`），提升可维护性。**NetworkBox 工具**：新增 3 个工具 — `create_network_box`（语义颜色预设：input 蓝/processing 绿/deform 橙/output 红/simulation 紫/utility 灰，可直接包含节点）、`add_nodes_to_box`、`list_network_boxes`；`get_network_structure` 增强支持 `box_name` 钻入模式和概览模式（自动折叠 box 节省 Token）。**NetworkBox 分组规范**：系统提示词要求 AI 在每个逻辑阶段完成后将节点打包到 NetworkBox 中（每组至少 6 个节点），并提供层级导航准则。**确认模式**：`AgentRunnerMixin` 为破坏性工具（创建/删除/修改）添加执行前确认对话框。**思考区块重构**：`ThinkingSection` 从 `QLabel` 切换为 `QPlainTextEdit`，自带滚动条和动态高度计算（与 `ChatInput` 同方案），最大高度 400px。**脉冲指示器**：`PulseIndicator` 动画透明度脉冲圆点，表示"进行中"状态。**工具状态栏**：`ToolStatusBar` 在输入框下方实时显示工具执行状态。**节点补全弹窗**：`NodeCompleterPopup` 支持 `@` 提及自动补全节点路径。**更新器重构**：改用 GitHub Releases API（而非基于 branch 的 VERSION 文件检查），缓存 `zipball_url`。**训练数据导出**：支持多模态消息内容提取（剥离图片，保留 list 格式中的文本）。**模块重载**：所有 Mixin 模块加入重载列表；`MainWindow` 引用重载后刷新；旧窗口调用 `deleteLater()` 干净销毁。
 - **v6.5** — **Agent / Ask 模式**：输入区域下方 Radio 风格切换 — Agent 模式拥有全部工具权限；Ask 模式限制为只读/查询工具，带白名单守卫和系统提示词约束。**Undo All / Keep All**：批量操作栏追踪所有待确认的节点/参数变更，"Undo All" 按逆序撤销，"Keep All" 一键全部确认。**深度思考框架**：`<think>` 标签现在要求结构化 6 步流程（理解→现状→方案→决策→计划→风险），附带明确的思考原则。**自动更新器**：`VERSION` 文件用于语义版本追踪；启动时静默检查 GitHub；一键下载+覆盖+重启，带进度对话框；更新时保留 `config/`、`cache/`、`trainData/`。`tools_override` 参数支持模式级工具过滤。ParamDiff 默认展开。参数值未变时跳过 undo 快照。

@@ -78,6 +78,9 @@ class AgentRunnerMixin:
         'update_todo',
         # NetworkBox（只读查看）
         'list_network_boxes',
+        # PerfMon 性能分析（只读）
+        'perf_start_profile',
+        'perf_stop_and_report',
     })
 
     # ---------- 自动 AI 标题生成 ----------

@@ -1196,6 +1196,51 @@ HOUDINI_TOOLS = [
                 "required": []
             }
         }
+    },
+    # ============================================================
+    # PerfMon 性能分析工具
+    # ============================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "perf_start_profile",
+            "description": "启动 Houdini 性能 Profiling（基于 hou.perfMon）。用于详细分析 cook 耗时和内存增长。启动后需执行操作（如强制 cook），然后调用 perf_stop_and_report 获取分析报告。如果只需快速查看各节点 cook 时间排名，优先使用 run_skill(skill_name='analyze_cook_performance')。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Profile 标题（可选，默认 'AI Performance Analysis'）"
+                    },
+                    "force_cook_node": {
+                        "type": "string",
+                        "description": "启动 profile 后立即强制 cook 的节点路径（可选）。传入末端节点路径可触发整条链的 cook。"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "perf_stop_and_report",
+            "description": "停止性能 Profiling 并返回分析报告。必须先调用 perf_start_profile 启动。报告包含各节点 cook 时间排名、内存统计等。可选保存 .hperf 文件到磁盘。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "save_path": {
+                        "type": "string",
+                        "description": "保存 .hperf profile 文件的路径（可选）。如 'C:/tmp/profile.hperf'"
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "页码（从1开始），报告较长时翻页查看"
+                    }
+                },
+                "required": []
+            }
+        }
     }
 ]
 
@@ -2823,6 +2868,7 @@ class AIClient:
                 'read_selection', 'search_node_types', 'semantic_search_nodes',
                 'find_nodes_by_param', 'check_errors', 'search_local_doc',
                 'get_houdini_node_doc', 'get_node_inputs', 'list_skills',
+                'perf_stop_and_report',
             })
             
             # 分离可并行工具（web + shell）和 Houdini 工具（需主线程串行）

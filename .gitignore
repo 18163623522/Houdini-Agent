@@ -19,6 +19,9 @@ cache/
 # Config (contains API keys)
 config/houdini_ai.ini
 
+# Training data (user-specific)
+trainData/
+
 # Temp/backup files
 *_backup.py
 *_new.py
