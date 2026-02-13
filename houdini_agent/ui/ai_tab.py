@@ -153,6 +153,7 @@ class AITab(
         self._in_think_block = False
         self._tag_parse_buf = ""
         self._thinking_needs_finalize = False  # 标记是否需要 finalize 思考区块
+        self._think_enabled = True  # 当前会话是否启用思考显示（由 Think 开关控制）
         
         # 会话级节点路径映射：name → set[path]，用于后处理裸节点名 → 完整路径
         self._session_node_map: dict[str, set[str]] = {}
@@ -1070,9 +1071,11 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                         self._emit_normal_content(buf[:pos])
                     buf = buf[pos + 7:]          # 跳过 <think>
                     self._in_think_block = True
-                    self._thinking_needs_finalize = True  # 进入思考，标记需要 finalize
-                    # 如果思考已 finalize，恢复为活跃状态并重启计时
-                    self._resume_thinking()
+                    # ★ Think 开关打开时才显示思考面板；关闭时静默丢弃 <think> 内容
+                    if self._think_enabled:
+                        self._thinking_needs_finalize = True  # 进入思考，标记需要 finalize
+                        # 如果思考已 finalize，恢复为活跃状态并重启计时
+                        self._resume_thinking()
                     continue
                 # 检查末尾是否有不完整的 <think>
                 hold = self._partial_tag_at_end(buf, '<think>')
@@ -1088,23 +1091,27 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                 # ── 思考模式：寻找 </think> ──
                 pos = buf.find('</think>')
                 if pos >= 0:
-                    if pos > 0:
+                    if self._think_enabled and pos > 0:
                         self._addThinking.emit(buf[:pos])
                     buf = buf[pos + 8:]          # 跳过 </think>
                     self._in_think_block = False
                     # 思考结束：立即 finalize 思考区块并停止计时器
-                    self._finalize_thinking()
+                    if self._think_enabled:
+                        self._finalize_thinking()
                     continue
                 # 检查末尾是否有不完整的 </think>
                 hold = self._partial_tag_at_end(buf, '</think>')
                 if hold:
-                    safe = buf[:-hold]
-                    if safe:
-                        self._addThinking.emit(safe)
+                    if self._think_enabled:
+                        safe = buf[:-hold]
+                        if safe:
+                            self._addThinking.emit(safe)
                     self._tag_parse_buf = buf[-hold:]
                     return
                 # 全部是思考内容
-                self._addThinking.emit(buf)
+                if self._think_enabled:
+                    self._addThinking.emit(buf)
+                # ★ Think 关闭时：静默丢弃 <think> 块内的内容
                 self._tag_parse_buf = ""
                 return
         self._tag_parse_buf = ""
@@ -1229,8 +1236,11 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         return True
 
     def _on_thinking_chunk(self, text: str):
-        """处理原生 reasoning_content（DeepSeek R1 等模型）"""
-        if text:
+        """处理原生 reasoning_content（DeepSeek R1 等模型）
+        
+        ★ 受 Think 开关控制：关闭时静默丢弃
+        """
+        if text and self._think_enabled:
             self._addThinking.emit(text)
     
     @QtCore.Slot(str)
@@ -1283,7 +1293,9 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         # 刷新标签解析缓冲区残余内容
         if self._tag_parse_buf:
             if self._in_think_block:
-                self._addThinking.emit(self._tag_parse_buf)
+                if self._think_enabled:
+                    self._addThinking.emit(self._tag_parse_buf)
+                # Think 关闭时静默丢弃残余思考内容
             else:
                 self._emit_normal_content(self._tag_parse_buf)
             self._tag_parse_buf = ""
@@ -2371,6 +2383,9 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         context_limit = agent_params['context_limit']
         scene_context = agent_params.get('scene_context', {})
         supports_vision = agent_params.get('supports_vision', True)
+        
+        # ★ 存储 Think 开关状态，供 _drain_tag_buffer / _on_thinking_chunk 使用
+        self._think_enabled = use_think
         
         try:
             # ========================================

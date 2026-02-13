@@ -54,6 +54,8 @@ class HeaderMixin:
                 'claude-haiku-4-5',
                 'gemini-3-pro-image-preview',
                 'gpt-5.3-codex',
+                'glm-4.7',
+                'glm-5',
             ],
         }
         self._model_context_limits = {
@@ -70,6 +72,8 @@ class HeaderMixin:
             'claude-opus-4-6-kiro': 200000,
             'claude-haiku-4-5': 200000,
             'gemini-3-pro-image-preview': 128000,
+            # Duojie - GLM (Anthropic 协议)
+            'glm-5': 200000,
         }
         # 模型特性配置
         # supports_prompt_caching: 是否支持提示缓存（保持消息前缀稳定可自动命中）
@@ -97,6 +101,8 @@ class HeaderMixin:
             'claude-haiku-4-5':           {'supports_prompt_caching': True, 'supports_vision': True},
             # Duojie - Gemini
             'gemini-3-pro-image-preview': {'supports_prompt_caching': True, 'supports_vision': True},
+            # Duojie - GLM (Anthropic 协议)
+            'glm-5':                      {'supports_prompt_caching': True, 'supports_vision': False},
         }
         self._refresh_models('ollama')
         self.model_combo.setMinimumWidth(100)
