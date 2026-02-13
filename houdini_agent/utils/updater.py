@@ -55,7 +55,7 @@ def get_local_version() -> str:
 
 
 def _parse_version(v: str) -> Tuple[int, ...]:
-    """把 '6.5.0' 解析为 (6, 5, 0) 用于比较"""
+    """把 '1.2.1' 解析为 (1, 2, 1) 用于比较"""
     parts = []
     for seg in v.strip().split("."):
         try:
@@ -65,9 +65,31 @@ def _parse_version(v: str) -> Tuple[int, ...]:
     return tuple(parts)
 
 
+def _is_legacy_internal_version(v: str) -> bool:
+    """检测旧的内部版本号（major >= 5，如 7.0.1, 6.8.3 等）
+    
+    项目历史中 v1.0.0 之前使用了内部版本号 v5.0~v7.0.1，
+    这些数值大于正式 Release 版本号（1.x.x），会导致更新器
+    误判本地版本更新，需要特殊处理强制更新。
+    """
+    parts = _parse_version(v)
+    return len(parts) > 0 and parts[0] >= 5
+
+
 def _version_gt(remote: str, local: str) -> bool:
-    """remote > local ?"""
-    return _parse_version(remote) > _parse_version(local)
+    """remote > local ?
+    
+    特殊处理: 如果本地是旧内部版本号（major >= 5），
+    而远程是正式 Release 版本号（major < 5），强制视为有更新。
+    """
+    local_parts = _parse_version(local)
+    remote_parts = _parse_version(remote)
+    
+    # 旧内部版本号 → 正式版本号: 强制更新
+    if _is_legacy_internal_version(local) and not _is_legacy_internal_version(remote):
+        return True
+    
+    return remote_parts > local_parts
 
 
 # ==========================================================
@@ -115,7 +137,7 @@ def check_update(timeout: float = 8.0) -> dict:
         {
             'has_update': bool,
             'local_version': str,
-            'remote_version': str,   # Release tag（如 'v6.6.0' → '6.6.0'）
+            'remote_version': str,   # Release tag（如 'v1.2.1' → '1.2.1'）
             'release_name': str,     # Release 标题
             'release_notes': str,    # Release 说明（首行）
             'error': str,            # 出错信息（成功为 ''）
