@@ -48,6 +48,7 @@ from .cursor_widgets import (
     ClickableImageLabel,
     ToolStatusBar,
     NodeCompleterPopup,
+    StreamingCodePreview,
 )
 import re
 
@@ -89,6 +90,7 @@ class AITab(
     _autoTitleDone = QtCore.Signal(str, str)   # 自动标题生成完成: (session_id, title)
     _confirmToolRequest = QtCore.Signal()  # 确认模式：请求确认（参数通过属性传递，避免 QueuedConnection dict 问题）
     _confirmToolResult = QtCore.Signal(bool)        # 确认模式：结果 (True=执行, False=取消)
+    _toolArgsDelta = QtCore.Signal(str, str, str)   # 流式 VEX 预览: (tool_name, delta, accumulated)
     
     def __init__(self, parent=None, workspace_dir: Optional[Path] = None):
         super().__init__(parent)
@@ -191,6 +193,12 @@ class AITab(
         self._hideToolStatus.connect(self._on_hide_tool_status)
         self._autoTitleDone.connect(self._on_auto_title_done)
         self._confirmToolRequest.connect(self._on_confirm_tool_request, QtCore.Qt.QueuedConnection)
+        self._toolArgsDelta.connect(self._on_tool_args_delta)
+        
+        # ── 流式 VEX 预览状态 ──
+        self._streaming_preview = None          # 当前的 StreamingCodePreview widget
+        self._streaming_preview_tool = ""       # 正在流式预览的工具名
+        self._streaming_last_code = ""          # 上次解析出的完整代码（用于增量 diff）
         
         # 构建并缓存系统提示词（两个版本：有思考 / 无思考）
         self._system_prompt_think = self._build_system_prompt(with_thinking=True)
@@ -2667,7 +2675,10 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                     on_tool_result=lambda n, a, r: (
                         (self._add_tool_result(n, r, a), self._hideToolStatus.emit())
                         if n not in self._SILENT_TOOLS else None
-                    )
+                    ),
+                    on_tool_args_delta=lambda name, delta, acc: (
+                        self._toolArgsDelta.emit(name, delta, acc)
+                    ),
                 )
             elif tools:
                 # ★ Ask 模式：仍用 agent loop 但只提供只读工具
@@ -2810,6 +2821,9 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                 invoke_on_main(self, "_add_tool_result_ui", name, f"[ok] {result_text}")
                 return
             else:
+                # 失败时也结束流式预览
+                if name in self._VEX_TOOLS:
+                    self._finalize_streaming_preview()
                 # 失败时显示错误信息（继续下面的逻辑）
                 pass
         
@@ -2885,10 +2899,127 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         m = re.search(_PATH_RE, text)
         return [m.group(1)] if m else []
     
+    # ── 流式 VEX 预览 ─────────────────────────────────────
+    # VEX 相关的工具名（只有这些才需要流式预览）
+    _VEX_TOOLS = frozenset({'create_wrangle_node', 'set_node_parameter'})
+
+    # 常见的 VEX/代码参数名（set_node_parameter 只有在设置这些参数时才做流式预览）
+    _VEX_PARAM_NAMES = frozenset({
+        'snippet', 'vex_code', 'code', 'script', 'python',
+        'sopoutput', 'command', 'expr', 'expression',
+    })
+
+    @QtCore.Slot(str, str, str)
+    def _on_tool_args_delta(self, tool_name: str, delta: str, accumulated: str):
+        """主线程 slot：处理 tool_call 参数增量，流式预览 VEX 代码"""
+        try:
+            if tool_name not in self._VEX_TOOLS:
+                return
+
+            # set_node_parameter 只对 VEX/代码参数做流式预览
+            if tool_name == 'set_node_parameter':
+                # 尝试从已累积的 JSON 中提取 param_name
+                import re as _re
+                m = _re.search(r'"param_name"\s*:\s*"([^"]*)"', accumulated)
+                if m:
+                    param_name = m.group(1).lower()
+                    if param_name not in self._VEX_PARAM_NAMES:
+                        return
+                # 如果 param_name 还没出现，暂不创建预览（等到能确认是 VEX 参数再说）
+
+            # 从不完整的 JSON 中增量提取 VEX 代码
+            code = self._extract_vex_from_partial_json(tool_name, accumulated)
+            if not code:
+                return
+            
+            # 对于 set_node_parameter，只有代码超过一定长度才显示预览（避免为 "1.5" 这种值创建预览）
+            if tool_name == 'set_node_parameter' and len(code) < 10 and '\n' not in code:
+                return
+
+            # 如果还没有 StreamingCodePreview，则创建
+            if self._streaming_preview is None or self._streaming_preview_tool != tool_name:
+                resp = self._agent_response or self._current_response
+                if not resp:
+                    return
+                self._streaming_preview = StreamingCodePreview(tool_name, parent=resp)
+                self._streaming_preview_tool = tool_name
+                self._streaming_last_code = ""
+                resp.details_layout.addWidget(self._streaming_preview)
+                self._scroll_agent_to_bottom()
+
+            # 更新预览（StreamingCodePreview 内部做增量追加）
+            self._streaming_preview.update_code(code)
+            self._streaming_last_code = code
+        except RuntimeError:
+            pass  # widget 已被销毁
+
+    def _extract_vex_from_partial_json(self, tool_name: str, accumulated: str) -> str:
+        """从不完整的 JSON 字符串中增量提取 VEX 代码字段
+        
+        create_wrangle_node → 提取 "vex_code" 字段
+        set_node_parameter  → 提取 "value" 字段
+        """
+        import re as _re
+        # 确定要提取的字段名
+        if tool_name == 'create_wrangle_node':
+            field_pattern = r'"vex_code"\s*:\s*"'
+        else:
+            field_pattern = r'"value"\s*:\s*"'
+
+        m = _re.search(field_pattern, accumulated)
+        if not m:
+            return ""
+        start = m.end()
+
+        # 从 start 开始，解析 JSON 字符串内容（处理转义字符）
+        result_chars = []
+        i = start
+        while i < len(accumulated):
+            ch = accumulated[i]
+            if ch == '\\' and i + 1 < len(accumulated):
+                next_ch = accumulated[i + 1]
+                if next_ch == 'n':
+                    result_chars.append('\n')
+                elif next_ch == 't':
+                    result_chars.append('\t')
+                elif next_ch == '"':
+                    result_chars.append('"')
+                elif next_ch == '\\':
+                    result_chars.append('\\')
+                elif next_ch == '/':
+                    result_chars.append('/')
+                elif next_ch == 'r':
+                    result_chars.append('\r')
+                else:
+                    result_chars.append(next_ch)
+                i += 2
+            elif ch == '"':
+                break  # 字符串字面量结束
+            else:
+                result_chars.append(ch)
+                i += 1
+        return ''.join(result_chars)
+
+    def _finalize_streaming_preview(self):
+        """流式预览结束：移除预览 widget（ParamDiffWidget 会接替展示正式 diff）"""
+        if self._streaming_preview is not None:
+            try:
+                self._streaming_preview.setVisible(False)
+                self._streaming_preview.deleteLater()
+            except RuntimeError:
+                pass
+            self._streaming_preview = None
+            self._streaming_preview_tool = ""
+            self._streaming_last_code = ""
+
     @QtCore.Slot(str, str)
     def _on_add_node_operation(self, name: str, result: dict):
         """处理节点操作高亮显示"""
         try:
+            # ★ 工具执行完毕 → 结束流式预览
+            if name in self._VEX_TOOLS:
+                self._finalize_streaming_preview()
+            
             resp = self._agent_response or self._current_response
             if not resp:
                 return

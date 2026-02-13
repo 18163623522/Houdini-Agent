@@ -2229,6 +2229,16 @@ class AIClient:
                                         tool_calls_buffer[idx]['function']['name'] = fn['name']
                                     if 'arguments' in fn:
                                         tool_calls_buffer[idx]['function']['arguments'] += fn['arguments']
+                                        # ★ 广播 tool_call 参数增量 → UI 流式预览
+                                        _tname = tool_calls_buffer[idx]['function'].get('name', '')
+                                        if _tname:
+                                            results.append({
+                                                "type": "tool_args_delta",
+                                                "index": idx,
+                                                "name": _tname,
+                                                "delta": fn['arguments'],
+                                                "accumulated": tool_calls_buffer[idx]['function']['arguments'],
+                                            })
                         
                         # 完成（先发送工具调用，但不 return，等后续 usage chunk / [DONE]）
                         if finish_reason:
@@ -2515,7 +2525,8 @@ class AIClient:
                           on_content: Optional[Callable[[str], None]] = None,
                           on_thinking: Optional[Callable[[str], None]] = None,
                           on_tool_call: Optional[Callable[[str, dict], None]] = None,
-                          on_tool_result: Optional[Callable[[str, dict, dict], None]] = None) -> Dict[str, Any]:
+                          on_tool_result: Optional[Callable[[str, dict, dict], None]] = None,
+                          on_tool_args_delta: Optional[Callable[[str, str, str], None]] = None) -> Dict[str, Any]:
         """流式 Agent Loop
         
         Args:
@@ -2679,6 +2690,14 @@ class AIClient:
                     round_thinking += thinking_text
                     if on_thinking and thinking_text:
                         on_thinking(thinking_text)
+                
+                elif chunk_type == 'tool_args_delta':
+                    if on_tool_args_delta:
+                        on_tool_args_delta(
+                            chunk.get('name', ''),
+                            chunk.get('delta', ''),
+                            chunk.get('accumulated', ''),
+                        )
                 
                 elif chunk_type == 'tool_call':
                     tc = chunk.get('tool_call')
@@ -3346,7 +3365,8 @@ class AIClient:
                               on_content: Optional[Callable[[str], None]] = None,
                               on_thinking: Optional[Callable[[str], None]] = None,
                               on_tool_call: Optional[Callable[[str, dict], None]] = None,
-                              on_tool_result: Optional[Callable[[str, dict, dict], None]] = None) -> Dict[str, Any]:
+                              on_tool_result: Optional[Callable[[str, dict, dict], None]] = None,
+                              on_tool_args_delta: Optional[Callable[[str, str, str], None]] = None) -> Dict[str, Any]:
         """JSON 模式 Agent Loop（用于不支持 Function Calling 的模型）"""
         
         if not self._tool_executor:

@@ -1511,6 +1511,41 @@ QLabel#diffLine[diffType="ctx"] {
 
 
 /* ============================================================
+   25b. STREAMING CODE PREVIEW (glass)
+   ============================================================ */
+
+QWidget#streamingCodePreview {
+    background: transparent;
+}
+QLabel#streamingCodeTitle {
+    color: #fbbf24;
+    font-size: {FS_XS}px;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    padding: 2px 6px;
+    background: transparent;
+}
+QLabel#streamingCodeTitle[state="done"] {
+    color: #10b981;
+}
+QPlainTextEdit#streamingCodeArea {
+    background: rgba(10,10,18,220);
+    color: #86efac;
+    border: 1px solid rgba(16,185,129,30);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: {FS_XS}px;
+    selection-background-color: rgba(59,130,246,60);
+}
+
+/* Diff scroll area (for partial collapse preview) */
+QScrollArea#diffScrollArea {
+    background: transparent;
+    border: none;
+}
+
+
+/* ============================================================
    26. CONTEXT MENU (glass)
    ============================================================ */
 

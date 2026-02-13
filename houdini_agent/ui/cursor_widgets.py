@@ -1129,15 +1129,29 @@ class AIResponse(QtWidgets.QWidget):
         self.execution_section.set_tool_result(tool_name, clean_result, success)
     
     def _auto_resize_content(self):
-        """根据文档实际行数自动调整 QPlainTextEdit 高度"""
+        """根据视觉行数（含自动换行）动态调整高度。
+        
+        与 ThinkingSection._update_height 相同的可靠方案：
+        逐块遍历 block.layout().lineCount() 统计真实视觉行数，
+        避免 doc.size().height() 在流式追加时返回旧值的问题。
+        """
         doc = self.content_label.document()
-        # documentSize().height() 返回文档布局后的像素高度
-        doc_height = int(doc.size().height())
-        # 加上上下 margin
-        new_h = doc_height + 8
+        visual_lines = 0
+        block = doc.begin()
+        while block.isValid():
+            bl = block.layout()
+            if bl and bl.lineCount() > 0:
+                visual_lines += bl.lineCount()
+            else:
+                visual_lines += 1
+            block = block.next()
+        visual_lines = max(1, visual_lines)
+        
+        target = self._content_line_h * visual_lines + 8
         min_h = self._content_line_h + 8
-        target = max(new_h, min_h)
-        if target != self.content_label.maximumHeight():
+        target = max(target, min_h)
+        current_h = self.content_label.maximumHeight()
+        if target != current_h:
             self.content_label.setFixedHeight(target)
     
     def append_content(self, text: str):
@@ -1485,6 +1499,61 @@ class NodeOperationLabel(QtWidgets.QWidget):
 
 
 # ============================================================
+# 流式代码预览组件（Streaming VEX Apply）
+# ============================================================
+
+class StreamingCodePreview(QtWidgets.QWidget):
+    """流式代码预览 — 像 Cursor Apply 一样逐行显示 AI 正在写的代码
+    
+    在 tool_call 参数流式到达时，实时显示 VEX 代码的书写过程。
+    工具执行完毕后，由 ai_tab 将其替换为正式的 ParamDiffWidget。
+    """
+
+    def __init__(self, tool_name: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("streamingCodePreview")
+        self._tool_name = tool_name
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(0)
+
+        # 标题行
+        self._title = QtWidgets.QLabel("✍ Writing code...")
+        self._title.setObjectName("streamingCodeTitle")
+        layout.addWidget(self._title)
+
+        # 代码显示区（只读，固定最大高度，自动滚动）
+        self._code_area = QtWidgets.QPlainTextEdit()
+        self._code_area.setReadOnly(True)
+        self._code_area.setObjectName("streamingCodeArea")
+        self._code_area.setMaximumHeight(200)
+        self._code_area.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        layout.addWidget(self._code_area)
+
+        # 记录上次已显示的代码长度，只追加增量
+        self._last_len = 0
+
+    def update_code(self, full_code: str):
+        """用完整代码字符串更新显示（增量追加新部分）"""
+        if len(full_code) > self._last_len:
+            delta = full_code[self._last_len:]
+            self._last_len = len(full_code)
+            self._code_area.moveCursor(QtGui.QTextCursor.End)
+            self._code_area.insertPlainText(delta)
+            # 自动滚动到底部
+            sb = self._code_area.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def finalize(self):
+        """流式结束，更新标题"""
+        self._title.setText("✓ Code complete")
+        self._title.setProperty("state", "done")
+        self._title.style().unpolish(self._title)
+        self._title.style().polish(self._title)
+
+
+# ============================================================
 # 参数 Diff 展示组件
 # ============================================================
 
@@ -1514,7 +1583,7 @@ class ParamDiffWidget(QtWidgets.QWidget):
 
     def __init__(self, param_name: str, old_value, new_value, parent=None):
         super().__init__(parent)
-        self._collapsed = False  # ★ 默认展开
+        self._collapsed = True  # ★ 默认折叠（露出预览窗口）
         
         old_str = self._to_str(old_value)
         new_str = self._to_str(new_value)
@@ -1527,16 +1596,16 @@ class ParamDiffWidget(QtWidgets.QWidget):
         
         if is_multiline:
             # ── 多行 diff (VEX 等) ──
-            # 标题行: param_name ▼ （默认展开，可手动折叠）
+            # 标题行: param_name ▶ （默认折叠，露出预览窗口）
             self._title_text = param_name
-            self._toggle_btn = QtWidgets.QPushButton(f"▼ {param_name}")
+            self._toggle_btn = QtWidgets.QPushButton(f"▶ {param_name}")
             self._toggle_btn.setFlat(True)
             self._toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
             self._toggle_btn.setObjectName("diffToggle")
             self._toggle_btn.clicked.connect(self._toggle)
             root_layout.addWidget(self._toggle_btn)
             
-            # diff 内容区（默认展开）
+            # diff 内容区（用 QScrollArea 包裹，折叠时露出预览窗口）
             self._diff_frame = QtWidgets.QFrame()
             self._diff_frame.setObjectName("diffFrame")
             diff_layout = QtWidgets.QVBoxLayout(self._diff_frame)
@@ -1573,9 +1642,20 @@ class ParamDiffWidget(QtWidgets.QWidget):
                         lbl.setProperty("diffType", "ctx")
                     diff_layout.addWidget(lbl)
             
-            # ★ 必须先 addWidget（设置 parent）再 setVisible，避免无 parent 窗口闪烁
-            root_layout.addWidget(self._diff_frame)
-            self._diff_frame.setVisible(True)  # 默认展开
+            # ★ 用 QScrollArea 包裹 diff_frame，折叠时限制高度而不是完全隐藏
+            self._scroll_area = QtWidgets.QScrollArea()
+            self._scroll_area.setObjectName("diffScrollArea")
+            self._scroll_area.setWidgetResizable(True)
+            self._scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+            self._scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            self._scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            self._scroll_area.setWidget(self._diff_frame)
+            
+            # 预览高度常量
+            self._PREVIEW_HEIGHT = 120   # 折叠时露出的高度(px)
+            
+            root_layout.addWidget(self._scroll_area)
+            self._scroll_area.setMaximumHeight(self._PREVIEW_HEIGHT)  # 默认折叠，露出预览窗口
         else:
             # ── 内联 diff (标量) ──
             inline = QtWidgets.QHBoxLayout()
@@ -1608,15 +1688,20 @@ class ParamDiffWidget(QtWidgets.QWidget):
     
     def _toggle(self):
         self._collapsed = not self._collapsed
-        self._diff_frame.setVisible(not self._collapsed)
+        if self._collapsed:
+            # 折叠 → 限制高度，露出预览窗口
+            self._scroll_area.setMaximumHeight(self._PREVIEW_HEIGHT)
+        else:
+            # 展开 → 取消高度限制
+            self._scroll_area.setMaximumHeight(16777215)
         arrow = "▶" if self._collapsed else "▼"
         self._toggle_btn.setText(f"{arrow} {self._title_text}")
     
     def collapse(self):
         """外部调用：强制折叠 diff（仅对多行 diff 有效）"""
-        if hasattr(self, '_diff_frame') and not self._collapsed:
+        if hasattr(self, '_scroll_area') and not self._collapsed:
             self._collapsed = True
-            self._diff_frame.setVisible(False)
+            self._scroll_area.setMaximumHeight(self._PREVIEW_HEIGHT)
             self._toggle_btn.setText(f"▶ {self._title_text}")
     
     def _add_block(self, parent_layout, title: str, text: str, is_old: bool):
